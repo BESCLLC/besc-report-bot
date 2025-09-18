@@ -21,11 +21,11 @@ When submitting a report, include:
 
 • Your wallet address  
 • Transaction hash (TXN)  
-• If it's a Solana → VSC bridge issue:  
+• If it's a Solana → BESC bridge issue:  
   - Solana wallet address  
   - Transaction hash  
   - Amount sent  
-  - VSC wallet address to receive BUSDC  
+  - BESC wallet address to receive BUSDC  
 • Any error codes or messages (if applicable)
 
 Providing full info helps us resolve your issue quickly.
