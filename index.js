@@ -37,13 +37,13 @@ bot.onText(/\/help/, (msg) => {
   bot.sendMessage(msg.chat.id,
 `📖 *How to Report an Issue (Step-by-Step)*
 
-✅ Follow this format for fastest resolution:
+Follow this format for the fastest resolution:
 
 \`\`\`
 1. Select issue type (/start)
 2. Paste your wallet address
 3. Paste the transaction hash (TX)
-4. Tell us what went wrong (include error message)
+4. Describe what went wrong (include any error message)
 5. Attach screenshots (optional but helpful)
 \`\`\`
 
@@ -60,7 +60,7 @@ bot.onText(/\/start/, (msg) => {
   bot.sendMessage(msg.chat.id,
 `🚨 *BESCswap & BESCbridge Bug Report Bot* 🚨
 
-To get help quickly, please provide:
+Please provide:
 • Wallet address  
 • Transaction hash (TXN)  
 • If Solana → BESC bridge: Solana address + TX + amount + destination wallet  
@@ -83,10 +83,10 @@ To get help quickly, please provide:
 bot.on('callback_query', (cbq) => {
   userSelections.set(cbq.from.id, cbq.data);
   const selectedText = {
-    swap_issue: "🟣 *BESCSWAP Selected*\nPlease describe your issue below 👇",
-    bridge_issue: "🟠 *BESCbridge Selected*\nPlease describe your issue below 👇",
-    wbesc_issue: "🟡 *wBESC Bridge Selected*\nPlease describe your issue below 👇",
-    other_issue: "🔧 *Other Selected*\nPlease describe your issue below 👇"
+    swap_issue: "🟣 *BESCSWAP Selected*\nDescribe your issue below 👇",
+    bridge_issue: "🟠 *BESCbridge Selected*\nDescribe your issue below 👇",
+    wbesc_issue: "🟡 *wBESC Bridge Selected*\nDescribe your issue below 👇",
+    other_issue: "🔧 *Other Selected*\nDescribe your issue below 👇"
   }[cbq.data];
 
   bot.sendMessage(cbq.message.chat.id, selectedText, { parse_mode: 'Markdown' });
@@ -98,6 +98,7 @@ bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   if (msg.text && msg.text.startsWith('/')) return;
 
+  // --- Spam Cooldown ---
   const lastTime = cooldowns.get(msg.from.id) || 0;
   if (Date.now() - lastTime < 5000) {
     return bot.sendMessage(chatId, "⏳ Please wait a few seconds before sending another report.");
@@ -117,8 +118,8 @@ bot.on('message', async (msg) => {
   const solMatch = msg.text?.match(solAddr);
   const guessedChain = guessChain(msg.text);
 
-  let reportTitle = `📌 *[${categoryLabel} ISSUE]${guessedChain ? " – Chain: " + guessedChain : ""}*`;
-
+  // --- Build Report ---
+  const reportTitle = `📌 *[${categoryLabel} ISSUE]${guessedChain ? " – Chain: " + guessedChain : ""}*`;
   let report = `${reportTitle}\n\n`;
   report += `👤 **From:** [${msg.from.first_name || 'User'}](tg://user?id=${msg.from.id})\n`;
   report += `🔗 **Username:** ${msg.from.username ? `[@${msg.from.username}](https://t.me/${msg.from.username})` : 'N/A'}\n`;
@@ -132,6 +133,7 @@ bot.on('message', async (msg) => {
   report += `📅 **Timestamp:** ${formatDateUTC()}`;
 
   try {
+    // Send to admin group
     if (msg.photo) {
       await bot.sendPhoto(REPORT_CHANNEL_ID, msg.photo[msg.photo.length - 1].file_id, {
         caption: report,
@@ -141,8 +143,10 @@ bot.on('message', async (msg) => {
       await bot.sendMessage(REPORT_CHANNEL_ID, report, { parse_mode: 'Markdown' });
     }
 
-    bot.sendMessage(chatId, "✅ Your report has been submitted.\nThank you for providing details — our team will review and get back to you.");
+    // Confirm to user with summary
+    bot.sendMessage(chatId, `✅ *Your report has been submitted!*\nWe’ve logged it with the following details:\n\n${report}`, { parse_mode: 'Markdown' });
 
+    // TX explorer buttons
     if (txMatch) {
       let buttons;
       switch (guessedChain) {
@@ -158,15 +162,16 @@ bot.on('message', async (msg) => {
             [{ text: "BESC Explorer", url: `https://explorer.beschyperchain.com/tx/${txMatch[0]}` }]
           ];
       }
-      bot.sendMessage(chatId, "🔎 View your transaction:", { reply_markup: { inline_keyboard: buttons } });
+      buttons.push([{ text: "💬 DM This User", url: `tg://user?id=${msg.from.id}` }]);
+      bot.sendMessage(chatId, "🔎 Quick Actions:", { reply_markup: { inline_keyboard: buttons } });
     }
 
     if (!txMatch && !addrMatch && !solMatch) {
-      bot.sendMessage(chatId, "⚠️ Please include your TX hash and wallet address so we can resolve this faster.");
+      bot.sendMessage(chatId, "⚠️ Please include your TX hash and wallet address so we can fix faster.");
     }
 
   } catch (err) {
-    console.error("Failed to forward report:", err);
+    console.error("❌ Failed to forward report:", err);
     bot.sendMessage(chatId, "⚠️ Failed to submit report. Please try again later.");
   }
 });
