@@ -299,7 +299,7 @@ bot.on('callback_query', async (cbq) => {
         await bot.answerCallbackQuery(cbq.id, { text: '❌ Admin only!' });
         return;
       }
-      await limiter.schedule(() => bot.sendMessage(chatId, '📊 Loading stats...', { reply_markup: { inline_keyboard: [] } }));
+      await limiter.schedule(() => bot.sendMessage(chatId, '📊 Loading stats...', { parse_mode: 'Markdown' }));
       await limiter.schedule(() => bot.sendMessage(chatId, '📊 *Stats command triggered* - check recent /stats message.', { parse_mode: 'Markdown' }));
     } else if (['swap_issue', 'bridge_issue', 'wbesc_issue', 'moneyx_issue', 'casino_issue', 'other_issue'].includes(data)) {
       const categoryLabel = {
@@ -381,6 +381,33 @@ bot.on('callback_query', async (cbq) => {
         '💡 *Tip:* Use "Add More Info" to update.',
         { parse_mode: 'Markdown' }
       ));
+    } else if (data === 'skip_tx' || data === 'skip_attach') {
+      const nextState = data === 'skip_tx' && isBridgeCategory(state.data.category) ? 'waiting_dest_tx' : 
+                        data === 'skip_tx' ? 'waiting_desc' : 'waiting_attach';
+      if (nextState === 'waiting_dest_tx') {
+        setUserState(userId, nextState, { ...state.data, sourceTx: null });
+        await limiter.schedule(() => bot.sendMessage(chatId,
+          `✅ *Source TX skipped.*\n\n🔗 *Next: Provide Destination TX Hash for ${state.data.destChain} if known*\n\nReply with dest TX or type *skip*:`,
+          { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: 'Skip', callback_data: 'skip_tx' }]] } }
+        ));
+      } else if (nextState === 'waiting_desc') {
+        setUserState(userId, nextState, { ...state.data, sourceTx: null });
+        await limiter.schedule(() => bot.sendMessage(chatId,
+          `✅ *Source TX skipped.*\n\n📝 *Next: Describe the Issue*\n\n` +
+          `*Please include:*\n` +
+          `• What went wrong? (e.g., "unexpected error")\n` +
+          `• Amount involved\n` +
+          `• Exact error message\n` +
+          `• For bridges: Destination wallet if different\n` +
+          `• For MoneyX: Trading details\n` +
+          `• For Casino: USDC chain\n\n` +
+          `Reply with description:`,
+          { parse_mode: 'Markdown' }
+        ));
+      } else {
+        await buildAndSendReport(userId, state.data, state.data.attachments || [], chatId);
+        resetUserState(userId);
+      }
     } else {
       await bot.answerCallbackQuery(cbq.id, { text: 'Invalid selection.' });
     }
@@ -422,7 +449,7 @@ bot.on('message', async (msg) => {
     setUserState(userId, 'waiting_category', { category: 'other_issue' });
     await limiter.schedule(() => bot.sendMessage(chatId,
       `🔍 *Detected transaction data!*\nAuto-assigned to "Other" category.\nProceeding...`,
-      { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: 'Continue', callback_data: 'other_issue' }]] }
+      { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: 'Continue', callback_data: 'other_issue' }]] } }
     ));
     return;
   }
@@ -514,7 +541,7 @@ bot.on('message', async (msg) => {
     const chain = state.data.destChain;
     const isSol = chain === 'SOLANA';
 
-    if (lowerText === 'skip' || data === 'skip_tx') {
+    if (lowerText === 'skip') {
       isValid = true;
     } else if ((isSol ? solMatch : txMatch)) {
       tx = isSol ? solMatch[0] : txMatch[0];
@@ -563,7 +590,7 @@ bot.on('message', async (msg) => {
       attachments.push({ type: 'video', fileId: msg.video.file_id });
     } else if (msg.document) {
       attachments.push({ type: 'document', fileId: msg.document.file_id });
-    } else if (lowerText === 'skip' || data === 'skip_attach') {
+    } else if (lowerText === 'skip') {
       await buildAndSendReport(userId, data, attachments, chatId);
       resetUserState(userId);
       return;
