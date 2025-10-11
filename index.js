@@ -1,8 +1,8 @@
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
-const winston = require('winston'); // For structured logging
-const axios = require('axios'); // For potential external API calls
-const Bottleneck = require('bottleneck'); // For rate limiting
+const winston = require('winston');
+const axios = require('axios');
+const Bottleneck = require('bottleneck');
 
 // Initialize logger
 const logger = winston.createLogger({
@@ -30,7 +30,7 @@ if (!token || !REPORT_CHANNEL_ID) {
 
 // Rate limiter for Telegram API
 const limiter = new Bottleneck({
-  minTime: 1000 / 30, // Telegram API limit: ~30 req/s
+  minTime: 1000 / 30, // ~30 req/s
   maxConcurrent: 1
 });
 
@@ -38,16 +38,17 @@ const limiter = new Bottleneck({
 const bot = new TelegramBot(token, { polling: true });
 
 // State management
-const userStates = new Map(); // { userId: { state: 'category', data: { category: '', wallet: '', ... } } }
+const userStates = new Map();
 const cooldowns = new Map();
 const reportQueue = new Map();
+const explorerCache = new Map(); // Cache for explorer URL validation
 
 // Regex patterns
 const evmHash = /\b0x[a-fA-F0-9]{64}\b/;
 const evmAddr = /\b0x[a-fA-F0-9]{40}\b/;
 const solAddr = /\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/;
 
-// Chain explorers with fallback
+// Chain explorers
 const chainExplorers = {
   BSC: { tx: 'https://bscscan.com/tx/', addr: 'https://bscscan.com/address/' },
   ETH: { tx: 'https://etherscan.io/tx/', addr: 'https://etherscan.io/address/' },
@@ -57,7 +58,6 @@ const chainExplorers = {
   SOLANA: { tx: 'https://solscan.io/tx/', addr: 'https://solscan.io/account/' }
 };
 
-// Fallback explorer in case of errors
 const fallbackExplorer = {
   tx: 'https://blockscan.com/tx/',
   addr: 'https://blockscan.com/address/'
@@ -76,7 +76,7 @@ function guessChain(text = '') {
   if (text.includes('polygon') || text.includes('matic')) return 'POLYGON';
   if (text.includes('arb')) return 'ARBITRUM';
   if (text.includes('besc')) return 'BESC';
-  return 'BSC'; // Default to BSC for unknown
+  return 'BSC';
 }
 
 function validateEvmAddress(addr) {
@@ -120,13 +120,22 @@ function getAdminButtons(userId) {
   };
 }
 
-// Validate explorer URL availability
+// Validate explorer URL with caching
 async function validateExplorerUrl(url) {
+  if (explorerCache.has(url)) {
+    return explorerCache.get(url);
+  }
   try {
-    const response = await axios.head(url, { timeout: 5000 });
-    return response.status < 400;
+    const response = await axios.head(url, {
+      timeout: 5000,
+      headers: { 'User-Agent': 'BESCReportBot/1.0.1 (Node.js)' }
+    });
+    const isValid = response.status < 400;
+    explorerCache.set(url, isValid);
+    return isValid;
   } catch (err) {
     logger.warn(`Explorer URL ${url} is unavailable: ${err.message}`);
+    explorerCache.set(url, false);
     return false;
   }
 }
@@ -141,7 +150,7 @@ bot.onText(/\/stats/, async (msg) => {
   const uptime = process.uptime();
   const uptimeStr = `${Math.floor(uptime / 86400)}d ${Math.floor((uptime % 86400) / 3600)}h ${Math.floor((uptime % 3600) / 60)}m`;
 
-  await bot.sendMessage(msg.chat.id,
+  await limiter.schedule(() => bot.sendMessage(msg.chat.id,
     `📊 *Bot Statistics*\n\n` +
     `👥 Active Users: ${activeUsers}\n` +
     `📋 Reports in Progress: ${totalReports}\n` +
@@ -152,43 +161,38 @@ bot.onText(/\/stats/, async (msg) => {
     `• ETH: ${Array.from(userStates.values()).filter(s => s.data.chain === 'ETH').length} reports\n` +
     `• Bridge Issues: ${Array.from(userStates.values()).filter(s => s.data.category === 'bridge_issue').length} reports`,
     { parse_mode: 'Markdown' }
-  );
+  ));
 });
 
 bot.onText(/\/help/, async (msg) => {
-  const helpText = `📖 *How to Report an Issue*
-
-Our bot guides you step-by-step:
-
-1️⃣ *Start:* /start → Select issue type
-2️⃣ *Wallet:* Provide wallet address (auto-validated)
-3️⃣ *TX Hash:* Paste transaction hash (auto-detected chain)
-4️⃣ *Details:* Describe the issue + error messages
-5️⃣ *Proof:* Attach screenshots/videos (optional)
-6️⃣ *Submit:* Review & send
-
-🟢 *Pro Tips:*
-• Include amounts, timestamps, and exact errors
-• For Solana ↔ BESC bridges: Provide Solana TX + destination wallet
-• Use /cancel to restart
-• Bot auto-flags CRITICAL issues (stuck funds, hacks)
-
-🔒 *Privacy:* Data securely forwarded to admins only
-📊 *Track:* Use /stats (admin only)
-
-Questions? Reply directly!`;
-  await bot.sendMessage(msg.chat.id, helpText, { parse_mode: 'Markdown' });
+  const helpText = `📖 *How to Report an Issue*\n\n` +
+                   `Our bot guides you step-by-step:\n\n` +
+                   `1️⃣ *Start:* /start → Select issue type\n` +
+                   `2️⃣ *Wallet:* Provide wallet address (auto-validated)\n` +
+                   `3️⃣ *TX Hash:* Paste transaction hash (auto-detected chain)\n` +
+                   `4️⃣ *Details:* Describe the issue + error messages\n` +
+                   `5️⃣ *Proof:* Attach screenshots/videos (optional) or type *skip*\n` +
+                   `6️⃣ *Submit:* Review & send\n\n` +
+                   `🟢 *Pro Tips:*\n` +
+                   `• Include amounts, timestamps, and exact errors\n` +
+                   `• For Solana ↔ BESC bridges: Provide Solana TX + destination wallet\n` +
+                   `• Use /cancel to restart\n` +
+                   `• Bot auto-flags CRITICAL issues (stuck funds, hacks)\n\n` +
+                   `🔒 *Privacy:* Data securely forwarded to admins only\n` +
+                   `📊 *Track:* Use /stats (admin only)\n\n` +
+                   `Questions? Reply directly!`;
+  await limiter.schedule(() => bot.sendMessage(msg.chat.id, helpText, { parse_mode: 'Markdown' }));
 });
 
 bot.onText(/\/cancel/, async (msg) => {
   resetUserState(msg.from.id);
-  await bot.sendMessage(msg.chat.id, `🔄 *Report cancelled.* Start over with /start or /help.`, { parse_mode: 'Markdown' });
+  await limiter.schedule(() => bot.sendMessage(msg.chat.id, `🔄 *Report cancelled.* Start over with /start or /help.`, { parse_mode: 'Markdown' }));
 });
 
 bot.onText(/\/start/, async (msg) => {
   resetUserState(msg.from.id);
   setUserState(msg.from.id, 'waiting_category', {});
-  await bot.sendMessage(msg.chat.id,
+  await limiter.schedule(() => bot.sendMessage(msg.chat.id,
     `🚨 *Welcome to BESC Bug Report Bot* 🚨\n\n` +
     `We're here to resolve issues quickly!\n\n` +
     `👇 *Step 1: Select Issue Type*\n\n` +
@@ -205,7 +209,7 @@ bot.onText(/\/start/, async (msg) => {
         ]
       }
     }
-  );
+  ));
 });
 
 // Callback handler
@@ -217,7 +221,7 @@ bot.on('callback_query', async (cbq) => {
   try {
     switch (cbq.data) {
       case 'help':
-        await bot.sendMessage(chatId, '📖 Check /help for details!', { parse_mode: 'Markdown' });
+        await limiter.schedule(() => bot.sendMessage(chatId, '📖 Check /help for details!', { parse_mode: 'Markdown' }));
         break;
       case 'swap_issue':
       case 'bridge_issue':
@@ -230,7 +234,7 @@ bot.on('callback_query', async (cbq) => {
           wbesc_issue: '🟡 wBESC Bridge',
           other_issue: '🔧 Other'
         }[cbq.data];
-        await bot.sendMessage(chatId,
+        await limiter.schedule(() => bot.sendMessage(chatId,
           `${categoryLabel} *selected!*\n\n` +
           `👤 *Step 2: Provide Wallet Address*\n\n` +
           `Examples:\n` +
@@ -238,52 +242,52 @@ bot.on('callback_query', async (cbq) => {
           `• Solana: \`1ABC...\` (32-44 chars)\n\n` +
           `Reply with your address:`,
           { parse_mode: 'Markdown' }
-        );
+        ));
         break;
       case 'add_more':
         setUserState(userId, 'waiting_desc', state.data);
-        await bot.sendMessage(chatId, '➕ *Adding to your report.*\nReply with additional info:', { parse_mode: 'Markdown' });
+        await limiter.schedule(() => bot.sendMessage(chatId, '➕ *Adding to your report.*\nReply with additional info:', { parse_mode: 'Markdown' }));
         break;
       case 'status':
-        await bot.sendMessage(chatId,
+        await limiter.schedule(() => bot.sendMessage(chatId,
           '⏳ *Status Update:*\n' +
           'Your report is under review.\n' +
           'Expect a response within 24h via DM.\n\n' +
           '💡 *Tip:* Use "Add More Info" to update.',
           { parse_mode: 'Markdown' }
-        );
+        ));
         break;
       case 'admin_stats':
         if (!isAdmin(chatId)) {
           await bot.answerCallbackQuery(cbq.id, { text: '❌ Admin only!' });
           return;
         }
-        await bot.sendMessage(chatId, '📊 Loading stats...', { reply_markup: { inline_keyboard: [] } });
-        await bot.sendMessage(chatId, '📊 *Stats command triggered* - check recent /stats message.', { parse_mode: 'Markdown' });
+        await limiter.schedule(() => bot.sendMessage(chatId, '📊 Loading stats...', { reply_markup: { inline_keyboard: [] } }));
+        await limiter.schedule(() => bot.sendMessage(chatId, '📊 *Stats command triggered* - check recent /stats message.', { parse_mode: 'Markdown' }));
         break;
       case /^resolve_(\d+)$/.test(cbq.data) && cbq.data:
         const resolveUserId = cbq.data.split('_')[1];
-        await bot.editMessageReplyMarkup({ inline_keyboard: [] }, {
+        await limiter.schedule(() => bot.editMessageReplyMarkup({ inline_keyboard: [] }, {
           chat_id: chatId,
           message_id: cbq.message.message_id
-        });
-        await bot.sendMessage(chatId, `✅ *Report RESOLVED* for user \`${resolveUserId}\`\nNotify user via DM.`, { parse_mode: 'Markdown' });
+        }));
+        await limiter.schedule(() => bot.sendMessage(chatId, `✅ *Report RESOLVED* for user \`${resolveUserId}\`\nNotify user via DM.`, { parse_mode: 'Markdown' }));
         try {
-          await bot.sendMessage(resolveUserId,
+          await limiter.schedule(() => bot.sendMessage(resolveUserId,
             '🎉 *Great news!* Your BESC issue has been resolved.\nCheck your DMs for details.',
             { parse_mode: 'Markdown' }
-          );
+          ));
         } catch (e) {
           logger.error(`Failed to notify user ${resolveUserId}: ${e.message}`);
         }
         break;
       case /^reopen_(\d+)$/.test(cbq.data) && cbq.data:
         const reopenUserId = cbq.data.split('_')[1];
-        await bot.editMessageReplyMarkup(getAdminButtons(reopenUserId), {
+        await limiter.schedule(() => bot.editMessageReplyMarkup(getAdminButtons(reopenUserId), {
           chat_id: chatId,
           message_id: cbq.message.message_id
-        });
-        await bot.sendMessage(chatId, `🔄 *Report REOPENED* for user \`${reopenUserId}\``, { parse_mode: 'Markdown' });
+        }));
+        await limiter.schedule(() => bot.sendMessage(chatId, `🔄 *Report REOPENED* for user \`${reopenUserId}\``, { parse_mode: 'Markdown' }));
         break;
       default:
         await bot.answerCallbackQuery(cbq.id, { text: 'Invalid selection.' });
@@ -291,7 +295,7 @@ bot.on('callback_query', async (cbq) => {
     await bot.answerCallbackQuery(cbq.id);
   } catch (err) {
     logger.error(`Callback query error: ${err.message}`, { userId, data: cbq.data });
-    await bot.sendMessage(chatId, '⚠️ An error occurred. Please try again or use /start.', { parse_mode: 'Markdown' });
+    await limiter.schedule(() => bot.sendMessage(chatId, '⚠️ An error occurred. Please try again or use /start.', { parse_mode: 'Markdown' }));
   }
 });
 
@@ -304,18 +308,18 @@ bot.on('message', async (msg) => {
 
   if (msg.text && msg.text.toLowerCase() === 'cancel') {
     resetUserState(userId);
-    return bot.sendMessage(chatId, `🔄 *Report cancelled.* Start over with /start.`, { parse_mode: 'Markdown' });
+    return limiter.schedule(() => bot.sendMessage(chatId, `🔄 *Report cancelled.* Start over with /start.`, { parse_mode: 'Markdown' }));
   }
 
   // Cooldown check
   const lastTime = cooldowns.get(userId) || 0;
   if (Date.now() - lastTime < 3000) {
-    return bot.sendMessage(chatId, '⏳ Slow down! Wait 3 seconds before sending again.', { parse_mode: 'Markdown' });
+    return limiter.schedule(() => bot.sendMessage(chatId, '⏳ Slow down! Wait 3 seconds before sending again.', { parse_mode: 'Markdown' }));
   }
   cooldowns.set(userId, Date.now());
 
   const state = getUserState(userId);
-  const text = (msg.text || '').trim();
+  const text = (msg.text || '').trim().toLowerCase();
   const txMatch = text.match(evmHash);
   const addrMatch = text.match(evmAddr);
   const solMatch = text.match(solAddr);
@@ -323,17 +327,17 @@ bot.on('message', async (msg) => {
   // Auto-start for TX/address
   if (state.state === 'idle' && (txMatch || addrMatch || solMatch)) {
     setUserState(userId, 'waiting_category', { category: 'other_issue' });
-    await bot.sendMessage(chatId,
+    await limiter.schedule(() => bot.sendMessage(chatId,
       `🔍 *Detected transaction data!*\nAuto-assigned to "Other" category.\nProceeding to wallet step...`,
       { parse_mode: 'Markdown' }
-    );
+    ));
   }
 
   let nextState = state.state;
   let responseText = '';
 
   if (state.state === 'waiting_category' && !msg.text) {
-    return bot.sendMessage(chatId, `🚨 *Start your report with /start*`, { parse_mode: 'Markdown' });
+    return limiter.schedule(() => bot.sendMessage(chatId, `🚨 *Start your report with /start*`, { parse_mode: 'Markdown' }));
   }
 
   // Step: waiting_wallet
@@ -386,7 +390,7 @@ bot.on('message', async (msg) => {
 
     if (isValid) {
       setUserState(userId, 'waiting_desc', { ...state.data, tx, chain });
-      const explorerUrl = (await validateExplorerUrl(chainExplorers[chain]?.tx)) ? chainExplorers[chain].tx : fallbackExplorer.tx;
+      const explorerUrl = explorerCache.get(chainExplorers[chain]?.tx) ? chainExplorers[chain].tx : fallbackExplorer.tx;
       const explorerLink = `[View TX](${explorerUrl}${tx})`;
       responseText = `✅ *TX captured:* ${explorerLink}\n` +
                      `*Chain:* ${chain}\n\n` +
@@ -430,16 +434,21 @@ bot.on('message', async (msg) => {
       attachments.push({ type: 'video', fileId: msg.video.file_id });
     } else if (msg.document) {
       attachments.push({ type: 'document', fileId: msg.document.file_id });
-    } else if (text.toLowerCase() === 'skip') {
-      // Proceed to submit
+    } else if (text === 'skip') {
+      // Explicitly proceed to submit on 'skip'
+      await limiter.schedule(() => buildAndSendReport(userId, data, attachments, chatId));
+      resetUserState(userId);
+      return;
     } else {
+      // Append to description
       data.desc += `\n\nAdditional: ${text}`;
       setUserState(userId, 'waiting_attach', data);
-      responseText = `➕ *Added to description.* Send attachments or type *skip*.`;
-      await bot.sendMessage(chatId, responseText, { parse_mode: 'Markdown' });
+      responseText = `➕ *Added to description.* Send attachments or type *skip* to submit.`;
+      await limiter.schedule(() => bot.sendMessage(chatId, responseText, { parse_mode: 'Markdown' }));
       return;
     }
 
+    // Submit report with attachments
     await limiter.schedule(() => buildAndSendReport(userId, data, attachments, chatId));
     resetUserState(userId);
     return;
@@ -481,8 +490,8 @@ async function buildAndSendReport(userId, data, attachments = [], userChatId) {
     }
 
     const chain = finalChain;
-    const walletExplorer = (await validateExplorerUrl(chainExplorers[chain]?.addr)) ? chainExplorers[chain].addr : fallbackExplorer.addr;
-    const txExplorer = (await validateExplorerUrl(chainExplorers[chain]?.tx)) ? chainExplorers[chain].tx : fallbackExplorer.tx;
+    const walletExplorer = explorerCache.get(chainExplorers[chain]?.addr) ? chainExplorers[chain].addr : fallbackExplorer.addr;
+    const txExplorer = explorerCache.get(chainExplorers[chain]?.tx) ? chainExplorers[chain].tx : fallbackExplorer.tx;
 
     let report = `📌 *[${categoryLabel} ISSUE] – ${chain}* ${severity}\n\n` +
                  `👤 **Reporter:** ${user.first_name || 'User'} ${user.last_name ? `(${user.last_name})` : ''}\n` +
