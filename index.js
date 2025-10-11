@@ -1,27 +1,53 @@
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
+const winston = require('winston'); // For structured logging
+const axios = require('axios'); // For potential external API calls
+const Bottleneck = require('bottleneck'); // For rate limiting
 
+// Initialize logger
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.File({ filename: 'error.log', level: 'error' }),
+    new winston.transports.File({ filename: 'combined.log' }),
+    new winston.transports.Console()
+  ]
+});
+
+// Environment variables
 const token = process.env.BOT_TOKEN;
 const REPORT_CHANNEL_ID = process.env.REPORT_CHANNEL_ID;
-const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID; // Optional: Direct admin chat for alerts
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 
 if (!token || !REPORT_CHANNEL_ID) {
-  console.error("❌ Missing BOT_TOKEN or REPORT_CHANNEL_ID in .env");
-  process.exit(1); // Fixed syntax error
+  logger.error('Missing BOT_TOKEN or REPORT_CHANNEL_ID in .env');
+  process.exit(1);
 }
 
+// Rate limiter for Telegram API
+const limiter = new Bottleneck({
+  minTime: 1000 / 30, // Telegram API limit: ~30 req/s
+  maxConcurrent: 1
+});
+
+// Initialize bot
 const bot = new TelegramBot(token, { polling: true });
 
-// Enhanced state management
+// State management
 const userStates = new Map(); // { userId: { state: 'category', data: { category: '', wallet: '', ... } } }
 const cooldowns = new Map();
-const reportQueue = new Map(); // Temp store for building reports
+const reportQueue = new Map();
 
+// Regex patterns
 const evmHash = /\b0x[a-fA-F0-9]{64}\b/;
 const evmAddr = /\b0x[a-fA-F0-9]{40}\b/;
 const solAddr = /\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/;
 
-// Chain explorers mapping for dynamic links
+// Chain explorers with fallback
 const chainExplorers = {
   BSC: { tx: 'https://bscscan.com/tx/', addr: 'https://bscscan.com/address/' },
   ETH: { tx: 'https://etherscan.io/tx/', addr: 'https://etherscan.io/address/' },
@@ -31,19 +57,26 @@ const chainExplorers = {
   SOLANA: { tx: 'https://solscan.io/tx/', addr: 'https://solscan.io/account/' }
 };
 
+// Fallback explorer in case of errors
+const fallbackExplorer = {
+  tx: 'https://blockscan.com/tx/',
+  addr: 'https://blockscan.com/address/'
+};
+
+// Utility functions
 function formatDateUTC(date = new Date()) {
   return date.toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
 }
 
-function guessChain(text = "") {
+function guessChain(text = '') {
   text = text.toLowerCase();
-  if (text.includes("solana") || text.includes("sol")) return "SOLANA";
-  if (text.includes("bsc") || text.includes("bnb")) return "BSC";
-  if (text.includes("eth") || text.includes("ethereum")) return "ETH";
-  if (text.includes("polygon") || text.includes("matic")) return "POLYGON";
-  if (text.includes("arb")) return "ARBITRUM";
-  if (text.includes("besc")) return "BESC";
-  return null;
+  if (text.includes('solana') || text.includes('sol')) return 'SOLANA';
+  if (text.includes('bsc') || text.includes('bnb')) return 'BSC';
+  if (text.includes('eth') || text.includes('ethereum')) return 'ETH';
+  if (text.includes('polygon') || text.includes('matic')) return 'POLYGON';
+  if (text.includes('arb')) return 'ARBITRUM';
+  if (text.includes('besc')) return 'BESC';
+  return 'BSC'; // Default to BSC for unknown
 }
 
 function validateEvmAddress(addr) {
@@ -72,12 +105,10 @@ function resetUserState(userId) {
   cooldowns.delete(userId);
 }
 
-// Admin-only commands
 function isAdmin(chatId) {
   return ADMIN_CHAT_ID && chatId.toString() === ADMIN_CHAT_ID;
 }
 
-// Helper for admin buttons
 function getAdminButtons(userId) {
   return {
     inline_keyboard: [
@@ -89,161 +120,188 @@ function getAdminButtons(userId) {
   };
 }
 
-// --- /STATS COMMAND (Admin only) ---
-bot.onText(/\/stats/, (msg) => {
-  if (!isAdmin(msg.chat.id)) return;
+// Validate explorer URL availability
+async function validateExplorerUrl(url) {
+  try {
+    const response = await axios.head(url, { timeout: 5000 });
+    return response.status < 400;
+  } catch (err) {
+    logger.warn(`Explorer URL ${url} is unavailable: ${err.message}`);
+    return false;
+  }
+}
+
+// Commands
+bot.onText(/\/stats/, async (msg) => {
+  if (!isAdmin(msg.chat.id)) {
+    return bot.sendMessage(msg.chat.id, '❌ Admin only command.', { parse_mode: 'Markdown' });
+  }
   const totalReports = Array.from(userStates.values()).filter(s => s.state !== 'idle').length + reportQueue.size;
   const activeUsers = new Set(Array.from(userStates.keys())).size;
   const uptime = process.uptime();
   const uptimeStr = `${Math.floor(uptime / 86400)}d ${Math.floor((uptime % 86400) / 3600)}h ${Math.floor((uptime % 3600) / 60)}m`;
 
-  bot.sendMessage(msg.chat.id, 
-`📊 *Bot Statistics*
-
-👥 Active Users: ${activeUsers}
-📋 Reports in Progress: ${totalReports}
-⏱️ Uptime: ${uptimeStr}
-💬 Total Cooldowns: ${cooldowns.size}
-
-*Recent Activity:*
-• BSC: ${Array.from(userStates.values()).filter(s => s.data.chain === 'BSC').length} reports
-• ETH: ${Array.from(userStates.values()).filter(s => s.data.chain === 'ETH').length} reports
-• Bridge Issues: ${Array.from(userStates.values()).filter(s => s.data.category === 'bridge_issue').length} reports`, 
-{ parse_mode: 'Markdown' });
+  await bot.sendMessage(msg.chat.id,
+    `📊 *Bot Statistics*\n\n` +
+    `👥 Active Users: ${activeUsers}\n` +
+    `📋 Reports in Progress: ${totalReports}\n` +
+    `⏱️ Uptime: ${uptimeStr}\n` +
+    `💬 Total Cooldowns: ${cooldowns.size}\n\n` +
+    `*Recent Activity:*\n` +
+    `• BSC: ${Array.from(userStates.values()).filter(s => s.data.chain === 'BSC').length} reports\n` +
+    `• ETH: ${Array.from(userStates.values()).filter(s => s.data.chain === 'ETH').length} reports\n` +
+    `• Bridge Issues: ${Array.from(userStates.values()).filter(s => s.data.category === 'bridge_issue').length} reports`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
-// --- /HELP COMMAND ---
-bot.onText(/\/help/, (msg) => {
-  const helpText = `📖 *How to Report an Issue (Guided Flow)*
+bot.onText(/\/help/, async (msg) => {
+  const helpText = `📖 *How to Report an Issue*
 
-Our bot guides you step-by-step for complete reports:
+Our bot guides you step-by-step:
 
-1️⃣ **Start:** /start → Select issue type
-2️⃣ **Wallet:** Provide your wallet address (auto-validated)
-3️⃣ **TX Hash:** Paste transaction hash (auto-detected chain)
-4️⃣ **Details:** Describe the issue + error messages
-5️⃣ **Proof:** Attach screenshots/videos (optional)
-6️⃣ **Submit:** Review & send
+1️⃣ *Start:* /start → Select issue type
+2️⃣ *Wallet:* Provide wallet address (auto-validated)
+3️⃣ *TX Hash:* Paste transaction hash (auto-detected chain)
+4️⃣ *Details:* Describe the issue + error messages
+5️⃣ *Proof:* Attach screenshots/videos (optional)
+6️⃣ *Submit:* Review & send
 
 🟢 *Pro Tips:*
 • Include amounts, timestamps, and exact errors
-• For Solana → BESC bridges: Provide Solana TX + destination wallet
-• Use /cancel to restart anytime
+• For Solana ↔ BESC bridges: Provide Solana TX + destination wallet
+• Use /cancel to restart
 • Bot auto-flags CRITICAL issues (stuck funds, hacks)
 
-🔒 *Privacy:* Your data is securely forwarded to admins only
-📊 *Track:* Use /stats (admin only) to monitor
+🔒 *Privacy:* Data securely forwarded to admins only
+📊 *Track:* Use /stats (admin only)
 
-Need more? Reply with questions!`;
-  bot.sendMessage(msg.chat.id, helpText, { parse_mode: "Markdown" });
+Questions? Reply directly!`;
+  await bot.sendMessage(msg.chat.id, helpText, { parse_mode: 'Markdown' });
 });
 
-// --- /CANCEL COMMAND ---
-bot.onText(/\/cancel/, (msg) => {
+bot.onText(/\/cancel/, async (msg) => {
   resetUserState(msg.from.id);
-  bot.sendMessage(msg.chat.id, `🔄 *Report cancelled.* Start over with /start or /help.`, { parse_mode: 'Markdown' });
+  await bot.sendMessage(msg.chat.id, `🔄 *Report cancelled.* Start over with /start or /help.`, { parse_mode: 'Markdown' });
 });
 
-// --- START COMMAND ---
-bot.onText(/\/start/, (msg) => {
+bot.onText(/\/start/, async (msg) => {
   resetUserState(msg.from.id);
   setUserState(msg.from.id, 'waiting_category', {});
-  bot.sendMessage(msg.chat.id,
-`🚨 *Welcome to BESC Bug Report Bot* 🚨
-
-We're here to fix issues fast! Let's get your details.
-
-👇 *Step 1: Select Issue Type*
-
-*Pro Tip:* Bot auto-detects chains (BSC/ETH/Solana) and flags critical issues!`, {
-    parse_mode: 'Markdown',
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: '🟣 BESCSWAP', callback_data: 'swap_issue' }],
-        [{ text: '🟠 BESCbridge', callback_data: 'bridge_issue' }],
-        [{ text: '🟡 wBESC Bridge', callback_data: 'wbesc_issue' }],
-        [{ text: '🔧 Other', callback_data: 'other_issue' }],
-        [{ text: '❓ Help', callback_data: 'help' }],
-      ]
+  await bot.sendMessage(msg.chat.id,
+    `🚨 *Welcome to BESC Bug Report Bot* 🚨\n\n` +
+    `We're here to resolve issues quickly!\n\n` +
+    `👇 *Step 1: Select Issue Type*\n\n` +
+    `*Pro Tip:* Bot auto-detects chains (BSC/ETH/Solana) and flags critical issues!`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🟣 BESCSWAP', callback_data: 'swap_issue' }],
+          [{ text: '🟠 BESCbridge', callback_data: 'bridge_issue' }],
+          [{ text: '🟡 wBESC Bridge', callback_data: 'wbesc_issue' }],
+          [{ text: '🔧 Other', callback_data: 'other_issue' }],
+          [{ text: '❓ Help', callback_data: 'help' }]
+        ]
+      }
     }
-  });
+  );
 });
 
-// --- CALLBACK HANDLER ---
+// Callback handler
 bot.on('callback_query', async (cbq) => {
   const userId = cbq.from.id;
   const chatId = cbq.message.chat.id;
   const state = getUserState(userId);
 
-  switch (cbq.data) {
-    case 'help':
-      await bot.sendMessage(chatId, "📖 Check /help for details!", { parse_mode: 'Markdown' });
-      break;
-    case 'swap_issue':
-    case 'bridge_issue':
-    case 'wbesc_issue':
-    case 'other_issue':
-      setUserState(userId, 'waiting_wallet', { category: cbq.data });
-      const categoryLabel = {
-        swap_issue: '🟣 BESCSWAP',
-        bridge_issue: '🟠 BESCbridge',
-        wbesc_issue: '🟡 wBESC Bridge',
-        other_issue: '🔧 Other'
-      }[cbq.data];
-      await bot.sendMessage(chatId, `${categoryLabel} *selected!*\n\n👤 *Step 2: Provide your Wallet Address*\n\nExamples:\n• EVM: \`0x1234...\` (40 chars)\n• Solana: \`1ABC...\` (32-44 chars)\n\nReply with your address:`, { parse_mode: 'Markdown' });
-      break;
-    case 'add_more':
-      const currentData = getUserState(userId).data;
-      setUserState(userId, 'waiting_desc', currentData);
-      await bot.sendMessage(chatId, '➕ *Adding to your report.*\nReply with additional info:');
-      break;
-    case 'status':
-      await bot.sendMessage(chatId, '⏳ *Status Update:*\nYour report is under review by our team.\n\nExpect a response within 24h via DM.\n\n💡 *Tip:* Use "add_more" button to provide updates.', { parse_mode: 'Markdown' });
-      break;
-    case 'admin_stats':
-      if (!isAdmin(cbq.message.chat.id)) {
-        await bot.answerCallbackQuery(cbq.id, { text: '❌ Admin only!' });
-        return;
-      }
-      await bot.sendMessage(chatId, '📊 Loading stats...', { reply_markup: { inline_keyboard: [] } });
-      bot.sendMessage(chatId, '📊 *Stats command triggered* - check recent /stats message.', { parse_mode: 'Markdown' });
-      break;
-    case /^resolve_(\d+)$/.test(cbq.data) && cbq.data:
-      const resolveUserId = cbq.data.split('_')[1];
-      await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { 
-        chat_id: cbq.message.chat.id, 
-        message_id: cbq.message.message_id 
-      });
-      await bot.sendMessage(cbq.message.chat.id, `✅ *Report RESOLVED* for user \`${resolveUserId}\`\n\nNotify user via DM.`, { parse_mode: 'Markdown' });
-      try {
-        await bot.sendMessage(resolveUserId, '🎉 *Great news!* Your BESC issue has been resolved by our team.\n\nCheck your DMs for details.', { parse_mode: 'Markdown' });
-      } catch (e) {
-        console.log('Could not notify resolved user:', e.message);
-      }
-      break;
-    case /^reopen_(\d+)$/.test(cbq.data) && cbq.data:
-      const reopenUserId = cbq.data.split('_')[1];
-      await bot.editMessageReplyMarkup(getAdminButtons(reopenUserId), { 
-        chat_id: cbq.message.chat.id, 
-        message_id: cbq.message.message_id 
-      });
-      await bot.sendMessage(cbq.message.chat.id, `🔄 *Report REOPENED* for user \`${reopenUserId}\`` , { parse_mode: 'Markdown' });
-      break;
-    default:
-      await bot.answerCallbackQuery(cbq.id, { text: 'Invalid selection.' });
+  try {
+    switch (cbq.data) {
+      case 'help':
+        await bot.sendMessage(chatId, '📖 Check /help for details!', { parse_mode: 'Markdown' });
+        break;
+      case 'swap_issue':
+      case 'bridge_issue':
+      case 'wbesc_issue':
+      case 'other_issue':
+        setUserState(userId, 'waiting_wallet', { category: cbq.data });
+        const categoryLabel = {
+          swap_issue: '🟣 BESCSWAP',
+          bridge_issue: '🟠 BESCbridge',
+          wbesc_issue: '🟡 wBESC Bridge',
+          other_issue: '🔧 Other'
+        }[cbq.data];
+        await bot.sendMessage(chatId,
+          `${categoryLabel} *selected!*\n\n` +
+          `👤 *Step 2: Provide Wallet Address*\n\n` +
+          `Examples:\n` +
+          `• EVM: \`0x1234...\` (40 chars)\n` +
+          `• Solana: \`1ABC...\` (32-44 chars)\n\n` +
+          `Reply with your address:`,
+          { parse_mode: 'Markdown' }
+        );
+        break;
+      case 'add_more':
+        setUserState(userId, 'waiting_desc', state.data);
+        await bot.sendMessage(chatId, '➕ *Adding to your report.*\nReply with additional info:', { parse_mode: 'Markdown' });
+        break;
+      case 'status':
+        await bot.sendMessage(chatId,
+          '⏳ *Status Update:*\n' +
+          'Your report is under review.\n' +
+          'Expect a response within 24h via DM.\n\n' +
+          '💡 *Tip:* Use "Add More Info" to update.',
+          { parse_mode: 'Markdown' }
+        );
+        break;
+      case 'admin_stats':
+        if (!isAdmin(chatId)) {
+          await bot.answerCallbackQuery(cbq.id, { text: '❌ Admin only!' });
+          return;
+        }
+        await bot.sendMessage(chatId, '📊 Loading stats...', { reply_markup: { inline_keyboard: [] } });
+        await bot.sendMessage(chatId, '📊 *Stats command triggered* - check recent /stats message.', { parse_mode: 'Markdown' });
+        break;
+      case /^resolve_(\d+)$/.test(cbq.data) && cbq.data:
+        const resolveUserId = cbq.data.split('_')[1];
+        await bot.editMessageReplyMarkup({ inline_keyboard: [] }, {
+          chat_id: chatId,
+          message_id: cbq.message.message_id
+        });
+        await bot.sendMessage(chatId, `✅ *Report RESOLVED* for user \`${resolveUserId}\`\nNotify user via DM.`, { parse_mode: 'Markdown' });
+        try {
+          await bot.sendMessage(resolveUserId,
+            '🎉 *Great news!* Your BESC issue has been resolved.\nCheck your DMs for details.',
+            { parse_mode: 'Markdown' }
+          );
+        } catch (e) {
+          logger.error(`Failed to notify user ${resolveUserId}: ${e.message}`);
+        }
+        break;
+      case /^reopen_(\d+)$/.test(cbq.data) && cbq.data:
+        const reopenUserId = cbq.data.split('_')[1];
+        await bot.editMessageReplyMarkup(getAdminButtons(reopenUserId), {
+          chat_id: chatId,
+          message_id: cbq.message.message_id
+        });
+        await bot.sendMessage(chatId, `🔄 *Report REOPENED* for user \`${reopenUserId}\``, { parse_mode: 'Markdown' });
+        break;
+      default:
+        await bot.answerCallbackQuery(cbq.id, { text: 'Invalid selection.' });
+    }
+    await bot.answerCallbackQuery(cbq.id);
+  } catch (err) {
+    logger.error(`Callback query error: ${err.message}`, { userId, data: cbq.data });
+    await bot.sendMessage(chatId, '⚠️ An error occurred. Please try again or use /start.', { parse_mode: 'Markdown' });
   }
-  bot.answerCallbackQuery(cbq.id);
 });
 
-// --- MAIN MESSAGE HANDLER ---
+// Main message handler
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
-  
-  if (msg.text && msg.text.startsWith('/')) {
-    return;
-  }
-  
+
+  if (msg.text && msg.text.startsWith('/')) return;
+
   if (msg.text && msg.text.toLowerCase() === 'cancel') {
     resetUserState(userId);
     return bot.sendMessage(chatId, `🔄 *Report cancelled.* Start over with /start.`, { parse_mode: 'Markdown' });
@@ -252,30 +310,30 @@ bot.on('message', async (msg) => {
   // Cooldown check
   const lastTime = cooldowns.get(userId) || 0;
   if (Date.now() - lastTime < 3000) {
-    return bot.sendMessage(chatId, "⏳ Hold on—sending too fast! Wait 3 seconds.");
+    return bot.sendMessage(chatId, '⏳ Slow down! Wait 3 seconds before sending again.', { parse_mode: 'Markdown' });
   }
   cooldowns.set(userId, Date.now());
 
   const state = getUserState(userId);
-  
-  // Fallback: Auto-start for TX/address without /start
   const text = (msg.text || '').trim();
   const txMatch = text.match(evmHash);
   const addrMatch = text.match(evmAddr);
   const solMatch = text.match(solAddr);
-  
+
+  // Auto-start for TX/address
   if (state.state === 'idle' && (txMatch || addrMatch || solMatch)) {
     setUserState(userId, 'waiting_category', { category: 'other_issue' });
-    await bot.sendMessage(chatId, `🔍 *Detected transaction data!*\nAuto-assigned to "Other" category.\n\nProceeding to wallet step...`, { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId,
+      `🔍 *Detected transaction data!*\nAuto-assigned to "Other" category.\nProceeding to wallet step...`,
+      { parse_mode: 'Markdown' }
+    );
   }
 
   let nextState = state.state;
   let responseText = '';
 
-  // Step: waiting_category
   if (state.state === 'waiting_category' && !msg.text) {
-    bot.sendMessage(chatId, `🚨 *Start your report with /start*`, { parse_mode: 'Markdown' });
-    return;
+    return bot.sendMessage(chatId, `🚨 *Start your report with /start*`, { parse_mode: 'Markdown' });
   }
 
   // Step: waiting_wallet
@@ -289,14 +347,24 @@ bot.on('message', async (msg) => {
       wallet = solMatch[0];
       isValid = true;
     }
-    
+
     if (isValid) {
       setUserState(userId, 'waiting_tx', { ...state.data, wallet });
       const chainGuess = guessChain(text);
-      responseText = `✅ *Wallet validated:* \`${wallet.slice(0, 10)}...\`\n${chainGuess ? `*Guessed chain:* ${chainGuess}\n` : ''}\n🔗 *Step 3: Provide Transaction Hash (TX)*\n\nPaste your TX hash:\n• EVM: \`0x...\` (64 hex chars)\n• Solana: Base58 signature\n\nReply with TX:`;
+      responseText = `✅ *Wallet validated:* \`${wallet.slice(0, 10)}...\`\n` +
+                     `${chainGuess ? `*Guessed chain:* ${chainGuess}\n` : ''}\n` +
+                     `🔗 *Step 3: Provide Transaction Hash (TX)*\n\n` +
+                     `Paste your TX hash:\n` +
+                     `• EVM: \`0x...\` (64 hex chars)\n` +
+                     `• Solana: Base58 signature\n\n` +
+                     `Reply with TX:`;
       nextState = 'waiting_tx';
     } else {
-      responseText = `⚠️ *Invalid wallet format.*\n\n*Examples:*\n• EVM: \`0x1234567890abcdef...\` (exactly 42 chars)\n• Solana: \`9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM\`\n\nTry again:`;
+      responseText = `⚠️ *Invalid wallet format.*\n\n` +
+                     `*Examples:*\n` +
+                     `• EVM: \`0x1234567890abcdef...\` (exactly 42 chars)\n` +
+                     `• Solana: \`9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM\`\n\n` +
+                     `Try again:`;
       nextState = 'waiting_wallet';
     }
   }
@@ -306,7 +374,7 @@ bot.on('message', async (msg) => {
     let tx = '';
     let chain = guessChain(text) || 'BSC';
     let isValid = false;
-    
+
     if (txMatch && validateEvmTxHash(txMatch[0])) {
       tx = txMatch[0];
       isValid = true;
@@ -315,14 +383,27 @@ bot.on('message', async (msg) => {
       chain = 'SOLANA';
       isValid = true;
     }
-    
+
     if (isValid) {
       setUserState(userId, 'waiting_desc', { ...state.data, tx, chain });
-      const explorerLink = chainExplorers[chain]?.tx ? `[View TX](${chainExplorers[chain].tx}${tx})` : `\`${tx.slice(0, 10)}...\``;
-      responseText = `✅ *TX captured:* ${explorerLink}\n*Chain:* ${chain}\n\n📝 *Step 4: Describe the Issue*\n\n*Please include:*\n• What went wrong?\n• Amount involved\n• Exact error message\n• For bridges: Destination wallet?\n\nReply with description:`;
+      const explorerUrl = (await validateExplorerUrl(chainExplorers[chain]?.tx)) ? chainExplorers[chain].tx : fallbackExplorer.tx;
+      const explorerLink = `[View TX](${explorerUrl}${tx})`;
+      responseText = `✅ *TX captured:* ${explorerLink}\n` +
+                     `*Chain:* ${chain}\n\n` +
+                     `📝 *Step 4: Describe the Issue*\n\n` +
+                     `*Please include:*\n` +
+                     `• What went wrong?\n` +
+                     `• Amount involved\n` +
+                     `• Exact error message\n` +
+                     `• For bridges: Destination wallet?\n\n` +
+                     `Reply with description:`;
       nextState = 'waiting_desc';
     } else {
-      responseText = `⚠️ *Invalid TX format.*\n\n*Examples:*\n• EVM: \`0x1234567890abcdef...\` (exactly 66 chars)\n• Solana: \`5EyP3MgvCY...\`\n\nTry again:`;
+      responseText = `⚠️ *Invalid TX format.*\n\n` +
+                     `*Examples:*\n` +
+                     `• EVM: \`0x1234567890abcdef...\` (exactly 66 chars)\n` +
+                     `• Solana: \`5EyP3MgvCY...\`\n\n` +
+                     `Try again:`;
       nextState = 'waiting_tx';
     }
   }
@@ -331,7 +412,10 @@ bot.on('message', async (msg) => {
   else if (state.state === 'waiting_desc') {
     const desc = text || '_No description provided_';
     setUserState(userId, 'waiting_attach', { ...state.data, desc });
-    responseText = `📝 *Description noted.*\n\n📎 *Step 5: Attach Proof (Optional)*\n\nSend screenshots/videos/documents or type *skip* to submit.\n\n(You can add more later via "Add More Info" button.)`;
+    responseText = `📝 *Description noted.*\n\n` +
+                   `📎 *Step 5: Attach Proof (Optional)*\n\n` +
+                   `Send screenshots/videos/documents or type *skip* to submit.\n\n` +
+                   `(You can add more later via "Add More Info" button.)`;
     nextState = 'waiting_attach';
   }
 
@@ -339,7 +423,7 @@ bot.on('message', async (msg) => {
   else if (state.state === 'waiting_attach') {
     const data = { ...state.data };
     let attachments = [];
-    
+
     if (msg.photo) {
       attachments.push({ type: 'photo', fileId: msg.photo[msg.photo.length - 1].file_id });
     } else if (msg.video) {
@@ -349,16 +433,14 @@ bot.on('message', async (msg) => {
     } else if (text.toLowerCase() === 'skip') {
       // Proceed to submit
     } else {
-      // Append to description
       data.desc += `\n\nAdditional: ${text}`;
       setUserState(userId, 'waiting_attach', data);
       responseText = `➕ *Added to description.* Send attachments or type *skip*.`;
-      bot.sendMessage(chatId, responseText, { parse_mode: 'Markdown' });
+      await bot.sendMessage(chatId, responseText, { parse_mode: 'Markdown' });
       return;
     }
 
-    // Submit report
-    await buildAndSendReport(userId, data, attachments, chatId);
+    await limiter.schedule(() => buildAndSendReport(userId, data, attachments, chatId));
     resetUserState(userId);
     return;
   }
@@ -370,178 +452,150 @@ bot.on('message', async (msg) => {
     setUserState(userId, state.state, data);
   }
 
-  // Send response
-  bot.sendMessage(chatId, responseText, { parse_mode: 'Markdown' });
+  await limiter.schedule(() => bot.sendMessage(chatId, responseText, { parse_mode: 'Markdown' }));
   setUserState(userId, nextState, state.data);
 });
 
-// --- REPORT BUILDING & SENDING ---
+// Report building and sending
 async function buildAndSendReport(userId, data, attachments = [], userChatId) {
-  const user = await bot.getChat(userId);
-  const categoryLabel = {
-    swap_issue: "🟣 BESCSWAP",
-    bridge_issue: "🟠 BESCbridge",
-    wbesc_issue: "🟡 wBESC Bridge",
-    other_issue: "🔧 Other"
-  }[data.category] || 'Unknown';
-
-  // Robust chain guessing + defaults
-  let finalChain = data.chain || 'BSC';
-  if (data.category === 'swap_issue' && !finalChain.includes('ETH')) {
-    finalChain = 'ETH'; // Heuristic: Swaps usually ETH
-  }
-
-  // Severity tagging
-  const descLower = (data.desc || '').toLowerCase();
-  let severity = '🟢 Low';
-  if (['stuck', 'lost', 'funds', 'hacked', 'urgent', 'exploit', 'drained'].some(kw => descLower.includes(kw))) {
-    severity = '🔴 Critical';
-  } else if (['error', 'failed', 'timeout', 'slow'].some(kw => descLower.includes(kw))) {
-    severity = '🟡 Medium';
-  }
-
-  // Dynamic explorer URLs
-  const chain = finalChain;
-  const walletExplorer = chainExplorers[chain]?.addr || chainExplorers.BSC.addr;
-  const txExplorer = chainExplorers[chain]?.tx || chainExplorers.BSC.tx;
-
-  // Ensure report fits Telegram's 4096-char limit
-  let report = `📌 *[${categoryLabel} ISSUE] – ${chain}* ${severity}\n\n`;
-  report += `👤 **Reporter:** ${user.first_name || 'User'} ${user.last_name ? `(${user.last_name})` : ''}\n`;
-  report += `🔗 **Username:** ${user.username ? `[@${user.username}](tg://user?id=${userId})` : 'N/A'}\n`;
-  report += `�ID **Telegram ID:** \`${userId}\`\n`;
-  if (data.wallet) {
-    report += `💼 **Wallet:** [${data.wallet.slice(0, 8)}...](${walletExplorer}${data.wallet})\n`;
-  }
-  if (data.tx) {
-    report += `🔗 **TX Hash:** [${data.tx.slice(0, 10)}...](${txExplorer}${data.tx})\n`;
-  }
-  report += `📝 **Description:**\n\`\`\`${data.desc || '_No description provided_'}\`\`\`\n\n`;
-  report += `📎 **Attachments:** ${attachments.length}\n`;
-  report += `📅 **Submitted:** ${formatDateUTC()}`;
-
-  // Flag incomplete reports
-  let completeness = '✅ Complete';
-  if (!data.wallet) completeness = '⚠️ MISSING WALLET';
-  if (!data.tx) completeness = '⚠️ MISSING TX';
-  if (!data.wallet && !data.tx) completeness = '🚨 INCOMPLETE - NEEDS FOLLOWUP';
-  report += `\n${completeness}`;
-
-  // Split report if too long (4096-char limit)
-  const MAX_MESSAGE_LENGTH = 4096;
-  const reportMessages = [];
-  if (report.length > MAX_MESSAGE_LENGTH) {
-    let currentMessage = '';
-    const lines = report.split('\n');
-    for (const line of lines) {
-      if (currentMessage.length + line.length + 1 > MAX_MESSAGE_LENGTH) {
-        reportMessages.push(currentMessage);
-        currentMessage = '';
-      }
-      currentMessage += line + '\n';
-    }
-    if (currentMessage) reportMessages.push(currentMessage);
-  } else {
-    reportMessages.push(report);
-  }
-
   try {
-    // Send report with attachments as album
+    const user = await bot.getChat(userId);
+    const categoryLabel = {
+      swap_issue: '🟣 BESCSWAP',
+      bridge_issue: '🟠 BESCbridge',
+      wbesc_issue: '🟡 wBESC Bridge',
+      other_issue: '🔧 Other'
+    }[data.category] || 'Unknown';
+
+    let finalChain = data.chain || 'BSC';
+    if (data.category === 'swap_issue' && !finalChain.includes('ETH')) {
+      finalChain = 'ETH';
+    }
+
+    const descLower = (data.desc || '').toLowerCase();
+    let severity = '🟢 Low';
+    if (['stuck', 'lost', 'funds', 'hacked', 'urgent', 'exploit', 'drained'].some(kw => descLower.includes(kw))) {
+      severity = '🔴 Critical';
+    } else if (['error', 'failed', 'timeout', 'slow'].some(kw => descLower.includes(kw))) {
+      severity = '🟡 Medium';
+    }
+
+    const chain = finalChain;
+    const walletExplorer = (await validateExplorerUrl(chainExplorers[chain]?.addr)) ? chainExplorers[chain].addr : fallbackExplorer.addr;
+    const txExplorer = (await validateExplorerUrl(chainExplorers[chain]?.tx)) ? chainExplorers[chain].tx : fallbackExplorer.tx;
+
+    let report = `📌 *[${categoryLabel} ISSUE] – ${chain}* ${severity}\n\n` +
+                 `👤 **Reporter:** ${user.first_name || 'User'} ${user.last_name ? `(${user.last_name})` : ''}\n` +
+                 `🔗 **Username:** ${user.username ? `[@${user.username}](tg://user?id=${userId})` : 'N/A'}\n` +
+                 `🆔 **Telegram ID:** \`${userId}\`\n`;
+    if (data.wallet) {
+      report += `💼 **Wallet:** [${data.wallet.slice(0, 8)}...](${walletExplorer}${data.wallet})\n`;
+    }
+    if (data.tx) {
+      report += `🔗 **TX Hash:** [${data.tx.slice(0, 10)}...](${txExplorer}${data.tx})\n`;
+    }
+    report += `📝 **Description:**\n\`\`\`${data.desc || '_No description provided_'}\`\`\`\n\n` +
+              `📎 **Attachments:** ${attachments.length}\n` +
+              `📅 **Submitted:** ${formatDateUTC()}`;
+
+    let completeness = '✅ Complete';
+    if (!data.wallet) completeness = '⚠️ MISSING WALLET';
+    if (!data.tx) completeness = '⚠️ MISSING TX';
+    if (!data.wallet && !data.tx) completeness = '🚨 INCOMPLETE - NEEDS FOLLOWUP';
+    report += `\n${completeness}`;
+
+    const MAX_MESSAGE_LENGTH = 4096;
+    const reportMessages = [];
+    if (report.length > MAX_MESSAGE_LENGTH) {
+      let currentMessage = '';
+      const lines = report.split('\n');
+      for (const line of lines) {
+        if (currentMessage.length + line.length + 1 > MAX_MESSAGE_LENGTH) {
+          reportMessages.push(currentMessage);
+          currentMessage = '';
+        }
+        currentMessage += line + '\n';
+      }
+      if (currentMessage) reportMessages.push(currentMessage);
+    } else {
+      reportMessages.push(report);
+    }
+
     let sentMediaGroupId = null;
     if (attachments.length > 0) {
-      const mediaGroup = [];
-      for (const att of attachments) {
-        if (att.type === 'photo') {
-          mediaGroup.push({
-            type: 'photo',
-            media: att.fileId,
-            caption: mediaGroup.length === 0 ? reportMessages[0] : undefined,
-            parse_mode: mediaGroup.length === 0 ? 'Markdown' : undefined
-          });
-        }
-      }
+      const mediaGroup = attachments
+        .filter(att => att.type === 'photo')
+        .map((att, i) => ({
+          type: 'photo',
+          media: att.fileId,
+          caption: i === 0 ? reportMessages[0] : undefined,
+          parse_mode: i === 0 ? 'Markdown' : undefined
+        }));
 
-      // Send photo album
       if (mediaGroup.length > 0) {
-        const sentMessages = await bot.sendMediaGroup(REPORT_CHANNEL_ID, mediaGroup);
+        const sentMessages = await limiter.schedule(() => bot.sendMediaGroup(REPORT_CHANNEL_ID, mediaGroup));
         sentMediaGroupId = sentMessages[0].message_id;
-        // Send remaining report parts
         for (let i = 1; i < reportMessages.length; i++) {
-          await bot.sendMessage(REPORT_CHANNEL_ID, reportMessages[i], {
+          await limiter.schedule(() => bot.sendMessage(REPORT_CHANNEL_ID, reportMessages[i], {
             parse_mode: 'Markdown',
             reply_markup: i === reportMessages.length - 1 ? getAdminButtons(userId) : {}
-          });
+          }));
         }
-        // Send non-photo attachments
-        for (const att of attachments) {
+        for (const att of attachments.filter(a => a.type !== 'photo')) {
           if (att.type === 'video') {
-            await bot.sendVideo(REPORT_CHANNEL_ID, att.fileId);
+            await limiter.schedule(() => bot.sendVideo(REPORT_CHANNEL_ID, att.fileId));
           } else if (att.type === 'document') {
-            await bot.sendDocument(REPORT_CHANNEL_ID, att.fileId);
+            await limiter.schedule(() => bot.sendDocument(REPORT_CHANNEL_ID, att.fileId));
           }
         }
       } else {
-        // No photos, send first attachment with first report part
         const firstAtt = attachments[0];
-        if (firstAtt.type === 'photo') {
-          await bot.sendPhoto(REPORT_CHANNEL_ID, firstAtt.fileId, {
-            caption: reportMessages[0],
-            parse_mode: 'Markdown',
-            reply_markup: reportMessages.length === 1 ? getAdminButtons(userId) : {}
-          });
-        } else if (firstAtt.type === 'video') {
-          await bot.sendVideo(REPORT_CHANNEL_ID, firstAtt.fileId, {
-            caption: reportMessages[0],
-            parse_mode: 'Markdown',
-            reply_markup: reportMessages.length === 1 ? getAdminButtons(userId) : {}
-          });
-        } else {
-          await bot.sendDocument(REPORT_CHANNEL_ID, firstAtt.fileId, {
-            caption: reportMessages[0],
-            parse_mode: 'Markdown',
-            reply_markup: reportMessages.length === 1 ? getAdminButtons(userId) : {}
-          });
-        }
-        // Send remaining report parts
+        const sendMethod = firstAtt.type === 'photo' ? bot.sendPhoto :
+                          firstAtt.type === 'video' ? bot.sendVideo : bot.sendDocument;
+        await limiter.schedule(() => sendMethod(REPORT_CHANNEL_ID, firstAtt.fileId, {
+          caption: reportMessages[0],
+          parse_mode: 'Markdown',
+          reply_markup: reportMessages.length === 1 ? getAdminButtons(userId) : {}
+        }));
         for (let i = 1; i < reportMessages.length; i++) {
-          await bot.sendMessage(REPORT_CHANNEL_ID, reportMessages[i], {
+          await limiter.schedule(() => bot.sendMessage(REPORT_CHANNEL_ID, reportMessages[i], {
             parse_mode: 'Markdown',
             reply_markup: i === reportMessages.length - 1 ? getAdminButtons(userId) : {}
-          });
+          }));
         }
-        // Send remaining attachments
         for (let i = 1; i < attachments.length; i++) {
           const att = attachments[i];
-          if (att.type === 'photo') await bot.sendPhoto(REPORT_CHANNEL_ID, att.fileId);
-          else if (att.type === 'video') await bot.sendVideo(REPORT_CHANNEL_ID, att.fileId);
-          else await bot.sendDocument(REPORT_CHANNEL_ID, att.fileId);
+          if (att.type === 'photo') await limiter.schedule(() => bot.sendPhoto(REPORT_CHANNEL_ID, att.fileId));
+          else if (att.type === 'video') await limiter.schedule(() => bot.sendVideo(REPORT_CHANNEL_ID, att.fileId));
+          else await limiter.schedule(() => bot.sendDocument(REPORT_CHANNEL_ID, att.fileId));
         }
       }
     } else {
-      // No attachments, send text reports
       for (let i = 0; i < reportMessages.length; i++) {
-        await bot.sendMessage(REPORT_CHANNEL_ID, reportMessages[i], {
+        await limiter.schedule(() => bot.sendMessage(REPORT_CHANNEL_ID, reportMessages[i], {
           parse_mode: 'Markdown',
           reply_markup: i === reportMessages.length - 1 ? getAdminButtons(userId) : {}
-        });
+        }));
       }
     }
 
-    // Admin alert
     if (ADMIN_CHAT_ID) {
       const alertText = `🔔 New ${severity.includes('Critical') ? '🚨 CRITICAL' : categoryLabel} report from ${user.first_name || userId}`;
-      await bot.sendMessage(ADMIN_CHAT_ID, alertText, { 
-        reply_markup: { 
-          inline_keyboard: [[{ text: 'View Report', url: `https://t.me/c/${REPORT_CHANNEL_ID.slice(4)}` }]] 
+      await limiter.schedule(() => bot.sendMessage(ADMIN_CHAT_ID, alertText, {
+        reply_markup: {
+          inline_keyboard: [[{ text: 'View Report', url: `https://t.me/c/${REPORT_CHANNEL_ID.slice(4)}` }]]
         }
-      });
+      }));
     }
 
-    // User confirmation
-    const userReview = `✅ *Report Submitted!*\n\n${categoryLabel} – ${chain} ${severity}\n${completeness}\n\nWallet: \`${data.wallet?.slice(0, 10) || 'N/A'}...\`\nTX: \`${data.tx?.slice(0, 10) || 'N/A'}...\`\n\nTeam will review within 24h. Updates via DM.`;
-    await bot.sendMessage(userChatId, userReview, { parse_mode: 'Markdown' });
+    const userReview = `✅ *Report Submitted!*\n\n` +
+                       `${categoryLabel} – ${chain} ${severity}\n` +
+                       `${completeness}\n\n` +
+                       `Wallet: \`${data.wallet?.slice(0, 10) || 'N/A'}...\`\n` +
+                       `TX: \`${data.tx?.slice(0, 10) || 'N/A'}...\`\n\n` +
+                       `Team will review within 24h. Updates via DM.`;
+    await limiter.schedule(() => bot.sendMessage(userChatId, userReview, { parse_mode: 'Markdown' }));
 
-    // User quick actions
     const userButtons = data.tx ? [
       [{ text: `🔍 View ${chain} TX`, url: `${txExplorer}${data.tx}` }],
       [{ text: '📎 Add More Info', callback_data: 'add_more' }],
@@ -550,17 +604,35 @@ async function buildAndSendReport(userId, data, attachments = [], userChatId) {
       [{ text: '📎 Add More Info', callback_data: 'add_more' }],
       [{ text: '❓ Status?', callback_data: 'status' }]
     ];
-    await bot.sendMessage(userChatId, '💡 *Quick Actions:*', { reply_markup: { inline_keyboard: userButtons } });
+    await limiter.schedule(() => bot.sendMessage(userChatId, '💡 *Quick Actions:*', {
+      reply_markup: { inline_keyboard: userButtons }
+    }));
 
   } catch (err) {
-    console.error("❌ Report send failed:", err);
-    bot.sendMessage(userChatId, "⚠️ Submission error—please /start again or contact admin directly.");
+    logger.error(`Report send failed for user ${userId}: ${err.message}`, { data, attachments });
+    await limiter.schedule(() => bot.sendMessage(userChatId,
+      '⚠️ Submission error—please /start again or contact admin directly.',
+      { parse_mode: 'Markdown' }
+    ));
   }
 }
 
-// Error handling
-bot.on('error', (err) => {
-  console.error('Bot error:', err);
+// Global error handling
+bot.on('polling_error', (err) => {
+  logger.error(`Polling error: ${err.message}`, { stack: err.stack });
 });
 
-console.log('🤖 BESC Bug Report Bot started! Polling for updates...');
+bot.on('error', (err) => {
+  logger.error(`Bot error: ${err.message}`, { stack: err.stack });
+});
+
+process.on('uncaughtException', (err) => {
+  logger.error(`Uncaught exception: ${err.message}`, { stack: err.stack });
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error(`Unhandled rejection: ${reason}`, { promise });
+});
+
+logger.info('🤖 BESC Bug Report Bot started! Polling for updates...');
