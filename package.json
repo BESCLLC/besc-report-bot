@@ -1,13 +1,34 @@
 {
   "name": "besc-report-bot",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Telegram bot for reporting BESCswap & BESCbridge issues",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
+    "axios": "^1.7.2",
+    "bottleneck": "^2.19.5",
     "dotenv": "^16.4.5",
-    "node-telegram-bot-api": "^0.64.0"
+    "node-telegram-bot-api": "^0.64.0",
+    "winston": "^3.13.0"
+  },
+  "devDependencies": {},
+  "engines": {
+    "node": "22.x"
+  },
+  "author": "Your Name or Team",
+  "license": "MIT",
+  "keywords": [
+    "telegram",
+    "bot",
+    "besc",
+    "blockchain",
+    "report"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-repo/besc-report-bot.git"
   }
 }
