@@ -50,33 +50,36 @@ const solAddr = /\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/;
 
 // Chain explorers
 const chainExplorers = {
-  BSC: { tx: 'https://bscscan.com/tx/', addr: 'https://bscscan.com/address/' },
-  ETH: { tx: 'https://etherscan.io/tx/', addr: 'https://etherscan.io/address/' },
-  POLYGON: { tx: 'https://polygonscan.com/tx/', addr: 'https://polygonscan.com/address/' },
-  ARBITRUM: { tx: 'https://arbiscan.io/tx/', addr: 'https://arbiscan.io/address/' },
-  BESC: { tx: 'https://explorer.beschyperchain.com/tx/', addr: 'https://explorer.beschyperchain.com/address/' },
-  SOLANA: { tx: 'https://solscan.io/tx/', addr: 'https://solscan.io/account/' }
+  BSC: { base: 'https://bscscan.com', tx: '/tx/', addr: '/address/' },
+  ETH: { base: 'https://etherscan.io', tx: '/tx/', addr: '/address/' },
+  POLYGON: { base: 'https://polygonscan.com', tx: '/tx/', addr: '/address/' },
+  ARBITRUM: { base: 'https://arbiscan.io', tx: '/tx/', addr: '/address/' },
+  AVALANCHE: { base: 'https://snowtrace.io', tx: '/tx/', addr: '/address/' },
+  OPTIMISM: { base: 'https://optimistic.etherscan.io', tx: '/tx/', addr: '/address/' },
+  BASE: { base: 'https://basescan.org', tx: '/tx/', addr: '/address/' },
+  BESC: { base: 'https://explorer.beschyperchain.com', tx: '/tx/', addr: '/address/' },
+  SOLANA: { base: 'https://solscan.io', tx: '/tx/', addr: '/account/' }
 };
 
 const fallbackExplorer = {
-  tx: 'https://blockscan.com/tx/',
-  addr: 'https://blockscan.com/address/'
+  base: 'https://blockscan.com',
+  tx: '/tx/',
+  addr: '/address/'
+};
+
+// Supported chains per category
+const supportedChains = {
+  swap_issue: ['BSC', 'ETH', 'BESC'],
+  other_issue: Object.keys(chainExplorers),
+  bridge_issue: ['POLYGON', 'SOLANA', 'ETH', 'BSC', 'ARBITRUM', 'AVALANCHE', 'OPTIMISM', 'BASE'],
+  wbesc_issue: ['ETH', 'BSC'],
+  moneyx_issue: ['BSC', 'ETH', 'BESC'],
+  casino_issue: ['SOLANA', 'BSC', 'ETH']
 };
 
 // Utility functions
 function formatDateUTC(date = new Date()) {
   return date.toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
-}
-
-function guessChain(text = '') {
-  text = text.toLowerCase();
-  if (text.includes('solana') || text.includes('sol')) return 'SOLANA';
-  if (text.includes('bsc') || text.includes('bnb')) return 'BSC';
-  if (text.includes('eth') || text.includes('ethereum')) return 'ETH';
-  if (text.includes('polygon') || text.includes('matic')) return 'POLYGON';
-  if (text.includes('arb')) return 'ARBITRUM';
-  if (text.includes('besc')) return 'BESC';
-  return 'BSC';
 }
 
 function validateEvmAddress(addr) {
@@ -120,7 +123,6 @@ function getAdminButtons(userId) {
   };
 }
 
-// Validate explorer URL with caching
 async function validateExplorerUrl(url) {
   if (explorerCache.has(url)) {
     return explorerCache.get(url);
@@ -128,7 +130,7 @@ async function validateExplorerUrl(url) {
   try {
     const response = await axios.head(url, {
       timeout: 5000,
-      headers: { 'User-Agent': 'BESCReportBot/1.0.1 (Node.js)' }
+      headers: { 'User-Agent': 'BESCReportBot/1.0.2 (Node.js)' }
     });
     const isValid = response.status < 400;
     explorerCache.set(url, isValid);
@@ -138,6 +140,46 @@ async function validateExplorerUrl(url) {
     explorerCache.set(url, false);
     return false;
   }
+}
+
+function isBridgeCategory(category) {
+  return category === 'bridge_issue' || category === 'wbesc_issue';
+}
+
+// Auto-suggest solutions based on description
+function suggestSolutions(desc, category) {
+  const lowerDesc = desc.toLowerCase();
+  const solutions = [];
+
+  if (lowerDesc.includes('unexpected error')) {
+    solutions.push('⚠️ "Unexpected error" detected. Try refreshing the page, clearing browser cache, or switching browsers. Ensure wallet is connected.');
+  }
+  if (lowerDesc.includes('page not found') || lowerDesc.includes('404')) {
+    solutions.push('🛑 "Page not found" error. Verify the URL (e.g., bescbridge.com). Check BESC X (@BESCLLC) for downtime notices.');
+  }
+  if (lowerDesc.includes('solscan') && lowerDesc.includes('404')) {
+    solutions.push('🔍 Solscan 404 error. Ensure the Solana TX hash is correct. Try alternative explorers like solana.fm.');
+  }
+  if (category === 'bridge_issue' || category === 'wbesc_issue') {
+    if (lowerDesc.includes('stuck') || lowerDesc.includes('pending')) {
+      solutions.push('⏳ Transaction stuck? Check source chain explorer (e.g., Etherscan). Increase gas or wait 30 mins. Contact support with TX hash.');
+    }
+    if (lowerDesc.includes('not arrived') || lowerDesc.includes('missing')) {
+      solutions.push('💸 Funds not arrived? Verify destination address. Wait 5-30 mins for cross-chain confirmation. Provide both TX hashes.');
+    }
+  }
+  if (category === 'moneyx_issue') {
+    if (lowerDesc.includes('trade') || lowerDesc.includes('perp')) {
+      solutions.push('📈 MoneyX trading issue? Check margin balance and leverage settings. Ensure sufficient funds for fees.');
+    }
+  }
+  if (category === 'casino_issue') {
+    if (lowerDesc.includes('usdc') || lowerDesc.includes('balance')) {
+      solutions.push('🎰 Casino USDC issue? Verify USDC approval on Solana/BSC/ETH. Check wallet balance and chain compatibility.');
+    }
+  }
+
+  return solutions.length > 0 ? solutions.join('\n') : 'ℹ️ No specific solutions detected. Please provide more details or attach screenshots.';
 }
 
 // Commands
@@ -157,9 +199,11 @@ bot.onText(/\/stats/, async (msg) => {
     `⏱️ Uptime: ${uptimeStr}\n` +
     `💬 Total Cooldowns: ${cooldowns.size}\n\n` +
     `*Recent Activity:*\n` +
-    `• BSC: ${Array.from(userStates.values()).filter(s => s.data.chain === 'BSC').length} reports\n` +
-    `• ETH: ${Array.from(userStates.values()).filter(s => s.data.chain === 'ETH').length} reports\n` +
-    `• Bridge Issues: ${Array.from(userStates.values()).filter(s => s.data.category === 'bridge_issue').length} reports`,
+    `• BSC: ${Array.from(userStates.values()).filter(s => s.data.sourceChain === 'BSC' || s.data.chain === 'BSC').length} reports\n` +
+    `• ETH: ${Array.from(userStates.values()).filter(s => s.data.sourceChain === 'ETH' || s.data.chain === 'ETH').length} reports\n` +
+    `• Bridge Issues: ${Array.from(userStates.values()).filter(s => isBridgeCategory(s.data.category)).length} reports\n` +
+    `• MoneyX: ${Array.from(userStates.values()).filter(s => s.data.category === 'moneyx_issue').length} reports\n` +
+    `• Casino: ${Array.from(userStates.values()).filter(s => s.data.category === 'casino_issue').length} reports`,
     { parse_mode: 'Markdown' }
   ));
 });
@@ -167,20 +211,24 @@ bot.onText(/\/stats/, async (msg) => {
 bot.onText(/\/help/, async (msg) => {
   const helpText = `📖 *How to Report an Issue*\n\n` +
                    `Our bot guides you step-by-step:\n\n` +
-                   `1️⃣ *Start:* /start → Select issue type\n` +
-                   `2️⃣ *Wallet:* Provide wallet address (auto-validated)\n` +
-                   `3️⃣ *TX Hash:* Paste transaction hash (auto-detected chain)\n` +
-                   `4️⃣ *Details:* Describe the issue + error messages\n` +
-                   `5️⃣ *Proof:* Attach screenshots/videos (optional) or type *skip*\n` +
-                   `6️⃣ *Submit:* Review & send\n\n` +
+                   `1️⃣ *Start:* /start → Select issue type (e.g., Bridge, MoneyX, Casino)\n` +
+                   `2️⃣ *For Bridges:* Select direction (to/from BESC) and external chain\n` +
+                   `3️⃣ *For Others:* Select chain\n` +
+                   `4️⃣ *Wallet:* Provide wallet address\n` +
+                   `5️⃣ *Source TX:* Paste source transaction hash\n` +
+                   `6️⃣ *Dest TX:* Paste destination TX (bridges only, optional)\n` +
+                   `7️⃣ *Details:* Describe issue (e.g., "unexpected error", amount, timestamp)\n` +
+                   `8️⃣ *Proof:* Attach screenshots/videos or type *skip*\n` +
+                   `9️⃣ *Submit:* Review & send\n\n` +
                    `🟢 *Pro Tips:*\n` +
-                   `• Include amounts, timestamps, and exact errors\n` +
-                   `• For Solana ↔ BESC bridges: Provide Solana TX + destination wallet\n` +
-                   `• Use /cancel to restart\n` +
-                   `• Bot auto-flags CRITICAL issues (stuck funds, hacks)\n\n` +
-                   `🔒 *Privacy:* Data securely forwarded to admins only\n` +
+                   `• Include exact errors (e.g., "page not found"), amounts, and TX hashes\n` +
+                   `• For bridges: Specify destination wallet if different\n` +
+                   `• MoneyX: Mention perp trading details\n` +
+                   `• Casino: Note USDC chain (Solana/BSC/ETH)\n` +
+                   `• Use /cancel to restart\n\n` +
+                   `🔒 *Privacy:* Data sent to admins only\n` +
                    `📊 *Track:* Use /stats (admin only)\n\n` +
-                   `Questions? Reply directly!`;
+                   `Questions? Reply or contact @BESCLLC on X!`;
   await limiter.schedule(() => bot.sendMessage(msg.chat.id, helpText, { parse_mode: 'Markdown' }));
 });
 
@@ -194,9 +242,9 @@ bot.onText(/\/start/, async (msg) => {
   setUserState(msg.from.id, 'waiting_category', {});
   await limiter.schedule(() => bot.sendMessage(msg.chat.id,
     `🚨 *Welcome to BESC Bug Report Bot* 🚨\n\n` +
-    `We're here to resolve issues quickly!\n\n` +
+    `Resolve issues fast for bridges, MoneyX, Casino, and more!\n\n` +
     `👇 *Step 1: Select Issue Type*\n\n` +
-    `*Pro Tip:* Bot auto-detects chains (BSC/ETH/Solana) and flags critical issues!`,
+    `*Pro Tip:* We’ll ask for chains and directions to make it easy!`,
     {
       parse_mode: 'Markdown',
       reply_markup: {
@@ -204,6 +252,8 @@ bot.onText(/\/start/, async (msg) => {
           [{ text: '🟣 BESCSWAP', callback_data: 'swap_issue' }],
           [{ text: '🟠 BESCbridge', callback_data: 'bridge_issue' }],
           [{ text: '🟡 wBESC Bridge', callback_data: 'wbesc_issue' }],
+          [{ text: '📈 MoneyX (Perps)', callback_data: 'moneyx_issue' }],
+          [{ text: '🎰 Casino (USDC)', callback_data: 'casino_issue' }],
           [{ text: '🔧 Other', callback_data: 'other_issue' }],
           [{ text: '❓ Help', callback_data: 'help' }]
         ]
@@ -217,84 +267,126 @@ bot.on('callback_query', async (cbq) => {
   const userId = cbq.from.id;
   const chatId = cbq.message.chat.id;
   const state = getUserState(userId);
+  const data = cbq.data;
 
   try {
-    switch (cbq.data) {
-      case 'help':
-        await limiter.schedule(() => bot.sendMessage(chatId, '📖 Check /help for details!', { parse_mode: 'Markdown' }));
-        break;
-      case 'swap_issue':
-      case 'bridge_issue':
-      case 'wbesc_issue':
-      case 'other_issue':
-        setUserState(userId, 'waiting_wallet', { category: cbq.data });
-        const categoryLabel = {
-          swap_issue: '🟣 BESCSWAP',
-          bridge_issue: '🟠 BESCbridge',
-          wbesc_issue: '🟡 wBESC Bridge',
-          other_issue: '🔧 Other'
-        }[cbq.data];
-        await limiter.schedule(() => bot.sendMessage(chatId,
-          `${categoryLabel} *selected!*\n\n` +
-          `👤 *Step 2: Provide Wallet Address*\n\n` +
-          `Examples:\n` +
-          `• EVM: \`0x1234...\` (40 chars)\n` +
-          `• Solana: \`1ABC...\` (32-44 chars)\n\n` +
-          `Reply with your address:`,
+    if (data === 'help') {
+      await limiter.schedule(() => bot.sendMessage(chatId, '📖 Check /help for details!', { parse_mode: 'Markdown' }));
+    } else if (/^resolve_/.test(data)) {
+      const resolveUserId = data.split('_')[1];
+      await limiter.schedule(() => bot.editMessageReplyMarkup({ inline_keyboard: [] }, {
+        chat_id: chatId,
+        message_id: cbq.message.message_id
+      }));
+      await limiter.schedule(() => bot.sendMessage(chatId, `✅ *Report RESOLVED* for user \`${resolveUserId}\`\nNotify user via DM.`, { parse_mode: 'Markdown' }));
+      try {
+        await limiter.schedule(() => bot.sendMessage(resolveUserId,
+          '🎉 *Great news!* Your BESC issue has been resolved.\nCheck your DMs or contact @BESCLLC for details.',
           { parse_mode: 'Markdown' }
         ));
-        break;
-      case 'add_more':
-        setUserState(userId, 'waiting_desc', state.data);
-        await limiter.schedule(() => bot.sendMessage(chatId, '➕ *Adding to your report.*\nReply with additional info:', { parse_mode: 'Markdown' }));
-        break;
-      case 'status':
-        await limiter.schedule(() => bot.sendMessage(chatId,
-          '⏳ *Status Update:*\n' +
-          'Your report is under review.\n' +
-          'Expect a response within 24h via DM.\n\n' +
-          '💡 *Tip:* Use "Add More Info" to update.',
-          { parse_mode: 'Markdown' }
-        ));
-        break;
-      case 'admin_stats':
-        if (!isAdmin(chatId)) {
-          await bot.answerCallbackQuery(cbq.id, { text: '❌ Admin only!' });
-          return;
-        }
-        await limiter.schedule(() => bot.sendMessage(chatId, '📊 Loading stats...', { reply_markup: { inline_keyboard: [] } }));
-        await limiter.schedule(() => bot.sendMessage(chatId, '📊 *Stats command triggered* - check recent /stats message.', { parse_mode: 'Markdown' }));
-        break;
-      case /^resolve_(\d+)$/.test(cbq.data) && cbq.data:
-        const resolveUserId = cbq.data.split('_')[1];
-        await limiter.schedule(() => bot.editMessageReplyMarkup({ inline_keyboard: [] }, {
+      } catch (e) {
+        logger.error(`Failed to notify user ${resolveUserId}: ${e.message}`);
+      }
+    } else if (/^reopen_/.test(data)) {
+      const reopenUserId = data.split('_')[1];
+      await limiter.schedule(() => bot.editMessageReplyMarkup(getAdminButtons(reopenUserId), {
+        chat_id: chatId,
+        message_id: cbq.message.message_id
+      }));
+      await limiter.schedule(() => bot.sendMessage(chatId, `🔄 *Report REOPENED* for user \`${reopenUserId}\``, { parse_mode: 'Markdown' }));
+    } else if (data === 'admin_stats') {
+      if (!isAdmin(chatId)) {
+        await bot.answerCallbackQuery(cbq.id, { text: '❌ Admin only!' });
+        return;
+      }
+      await limiter.schedule(() => bot.sendMessage(chatId, '📊 Loading stats...', { reply_markup: { inline_keyboard: [] } }));
+      await limiter.schedule(() => bot.sendMessage(chatId, '📊 *Stats command triggered* - check recent /stats message.', { parse_mode: 'Markdown' }));
+    } else if (['swap_issue', 'bridge_issue', 'wbesc_issue', 'moneyx_issue', 'casino_issue', 'other_issue'].includes(data)) {
+      const categoryLabel = {
+        swap_issue: '🟣 BESCSWAP',
+        bridge_issue: '🟠 BESCbridge',
+        wbesc_issue: '🟡 wBESC Bridge',
+        moneyx_issue: '📈 MoneyX (Perps)',
+        casino_issue: '🎰 Casino (USDC)',
+        other_issue: '🔧 Other'
+      }[data];
+      setUserState(userId, isBridgeCategory(data) ? 'waiting_direction' : 'waiting_chain', { category: data });
+      if (isBridgeCategory(data)) {
+        await limiter.schedule(() => bot.editMessageText(`${categoryLabel} *selected!*\n\n👇 *Step 2: Select Direction*`, {
           chat_id: chatId,
-          message_id: cbq.message.message_id
+          message_id: cbq.message.message_id,
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '➡️ To BESC Hyperchain', callback_data: 'direction_to' }],
+              [{ text: '⬅️ From BESC Hyperchain', callback_data: 'direction_from' }]
+            ]
+          }
         }));
-        await limiter.schedule(() => bot.sendMessage(chatId, `✅ *Report RESOLVED* for user \`${resolveUserId}\`\nNotify user via DM.`, { parse_mode: 'Markdown' }));
-        try {
-          await limiter.schedule(() => bot.sendMessage(resolveUserId,
-            '🎉 *Great news!* Your BESC issue has been resolved.\nCheck your DMs for details.',
-            { parse_mode: 'Markdown' }
-          ));
-        } catch (e) {
-          logger.error(`Failed to notify user ${resolveUserId}: ${e.message}`);
-        }
-        break;
-      case /^reopen_(\d+)$/.test(cbq.data) && cbq.data:
-        const reopenUserId = cbq.data.split('_')[1];
-        await limiter.schedule(() => bot.editMessageReplyMarkup(getAdminButtons(reopenUserId), {
+      } else {
+        const chains = supportedChains[data];
+        const keyboard = chains.map(c => [{ text: c, callback_data: `chain_${c}` }]);
+        await limiter.schedule(() => bot.editMessageText(`${categoryLabel} *selected!*\n\n👇 *Step 2: Select Chain*`, {
           chat_id: chatId,
-          message_id: cbq.message.message_id
+          message_id: cbq.message.message_id,
+          parse_mode: 'Markdown',
+          reply_markup: { inline_keyboard: keyboard }
         }));
-        await limiter.schedule(() => bot.sendMessage(chatId, `🔄 *Report REOPENED* for user \`${reopenUserId}\``, { parse_mode: 'Markdown' }));
-        break;
-      default:
-        await bot.answerCallbackQuery(cbq.id, { text: 'Invalid selection.' });
+      }
+    } else if (data.startsWith('direction_')) {
+      const direction = data === 'direction_to' ? 'to BESC' : 'from BESC';
+      setUserState(userId, 'waiting_external_chain', { ...state.data, direction });
+      const chains = supportedChains[state.data.category];
+      const keyboard = chains.map(c => [{ text: c, callback_data: `extchain_${c}` }]);
+      await limiter.schedule(() => bot.editMessageText(`Direction: *${direction}*\n\n👇 *Step 3: Select External Chain*`, {
+        chat_id: chatId,
+        message_id: cbq.message.message_id,
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: keyboard }
+      }));
+    } else if (data.startsWith('extchain_')) {
+      const extChain = data.split('_')[1];
+      let sourceChain, destChain;
+      if (state.data.direction === 'to BESC') {
+        sourceChain = extChain;
+        destChain = 'BESC';
+      } else {
+        sourceChain = 'BESC';
+        destChain = extChain;
+      }
+      setUserState(userId, 'waiting_wallet', { ...state.data, sourceChain, destChain });
+      await limiter.schedule(() => bot.editMessageText(`Chains: *${sourceChain} → ${destChain}*\n\n👤 *Step 4: Provide Wallet Address*\n\nExamples:\n• EVM: \`0x1234...\`\n• Solana: \`1ABC...\`\n\nReply with your address:`, {
+        chat_id: chatId,
+        message_id: cbq.message.message_id,
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [] }
+      }));
+    } else if (data.startsWith('chain_')) {
+      const chain = data.split('_')[1];
+      setUserState(userId, 'waiting_wallet', { ...state.data, chain });
+      await limiter.schedule(() => bot.editMessageText(`Chain: *${chain}*\n\n👤 *Step 3: Provide Wallet Address*\n\nExamples:\n• EVM: \`0x1234...\`\n• Solana: \`1ABC...\`\n\nReply with your address:`, {
+        chat_id: chatId,
+        message_id: cbq.message.message_id,
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [] }
+      }));
+    } else if (data === 'add_more') {
+      setUserState(userId, 'waiting_desc', state.data);
+      await limiter.schedule(() => bot.sendMessage(chatId, '➕ *Adding to your report.*\nReply with additional info:', { parse_mode: 'Markdown' }));
+    } else if (data === 'status') {
+      await limiter.schedule(() => bot.sendMessage(chatId,
+        '⏳ *Status Update:*\n' +
+        'Your report is under review.\n' +
+        'Expect a response within 24h via DM or check @BESCLLC on X.\n\n' +
+        '💡 *Tip:* Use "Add More Info" to update.',
+        { parse_mode: 'Markdown' }
+      ));
+    } else {
+      await bot.answerCallbackQuery(cbq.id, { text: 'Invalid selection.' });
     }
     await bot.answerCallbackQuery(cbq.id);
   } catch (err) {
-    logger.error(`Callback query error: ${err.message}`, { userId, data: cbq.data });
+    logger.error(`Callback query error: ${err.message}`, { userId, data });
     await limiter.schedule(() => bot.sendMessage(chatId, '⚠️ An error occurred. Please try again or use /start.', { parse_mode: 'Markdown' }));
   }
 });
@@ -319,7 +411,8 @@ bot.on('message', async (msg) => {
   cooldowns.set(userId, Date.now());
 
   const state = getUserState(userId);
-  const text = (msg.text || '').trim().toLowerCase();
+  const text = (msg.text || '').trim();
+  const lowerText = text.toLowerCase();
   const txMatch = text.match(evmHash);
   const addrMatch = text.match(evmAddr);
   const solMatch = text.match(solAddr);
@@ -328,12 +421,12 @@ bot.on('message', async (msg) => {
   if (state.state === 'idle' && (txMatch || addrMatch || solMatch)) {
     setUserState(userId, 'waiting_category', { category: 'other_issue' });
     await limiter.schedule(() => bot.sendMessage(chatId,
-      `🔍 *Detected transaction data!*\nAuto-assigned to "Other" category.\nProceeding to wallet step...`,
-      { parse_mode: 'Markdown' }
+      `🔍 *Detected transaction data!*\nAuto-assigned to "Other" category.\nProceeding...`,
+      { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: 'Continue', callback_data: 'other_issue' }]] }
     ));
+    return;
   }
 
-  let nextState = state.state;
   let responseText = '';
 
   if (state.state === 'waiting_category' && !msg.text) {
@@ -349,84 +442,120 @@ bot.on('message', async (msg) => {
       isValid = true;
     } else if (solMatch && validateSolAddress(solMatch[0])) {
       wallet = solMatch[0];
-      isValid = true;
+      isValid = state.data.sourceChain === 'SOLANA' || state.data.destChain === 'SOLANA' || state.data.chain === 'SOLANA';
     }
 
     if (isValid) {
-      setUserState(userId, 'waiting_tx', { ...state.data, wallet });
-      const chainGuess = guessChain(text);
-      responseText = `✅ *Wallet validated:* \`${wallet.slice(0, 10)}...\`\n` +
-                     `${chainGuess ? `*Guessed chain:* ${chainGuess}\n` : ''}\n` +
-                     `🔗 *Step 3: Provide Transaction Hash (TX)*\n\n` +
-                     `Paste your TX hash:\n` +
+      setUserState(userId, 'waiting_source_tx', { ...state.data, wallet });
+      responseText = `✅ *Wallet validated:* \`${wallet.slice(0, 10)}...\`\n\n` +
+                     `🔗 *Next: Provide Source Transaction Hash (TX)*\n\n` +
+                     `Paste your source TX hash for ${state.data.sourceChain || state.data.chain}:\n` +
                      `• EVM: \`0x...\` (64 hex chars)\n` +
                      `• Solana: Base58 signature\n\n` +
-                     `Reply with TX:`;
-      nextState = 'waiting_tx';
+                     `Reply with TX or type *skip* if unknown:`;
     } else {
-      responseText = `⚠️ *Invalid wallet format.*\n\n` +
+      responseText = `⚠️ *Invalid wallet format for ${state.data.sourceChain || state.data.chain}.*\n\n` +
                      `*Examples:*\n` +
                      `• EVM: \`0x1234567890abcdef...\` (exactly 42 chars)\n` +
                      `• Solana: \`9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM\`\n\n` +
                      `Try again:`;
-      nextState = 'waiting_wallet';
     }
+    await limiter.schedule(() => bot.sendMessage(chatId, responseText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: 'Skip', callback_data: 'skip_tx' }]] } }));
+    return;
   }
 
-  // Step: waiting_tx
-  else if (state.state === 'waiting_tx') {
+  // Step: waiting_source_tx
+  if (state.state === 'waiting_source_tx') {
     let tx = '';
-    let chain = guessChain(text) || 'BSC';
     let isValid = false;
+    const chain = state.data.sourceChain || state.data.chain;
+    const isSol = chain === 'SOLANA';
 
-    if (txMatch && validateEvmTxHash(txMatch[0])) {
-      tx = txMatch[0];
+    if (lowerText === 'skip') {
       isValid = true;
-    } else if (solMatch && !addrMatch) {
-      tx = solMatch[0];
-      chain = 'SOLANA';
-      isValid = true;
+    } else if ((isSol ? solMatch : txMatch)) {
+      tx = isSol ? solMatch[0] : txMatch[0];
+      isValid = isSol ? true : validateEvmTxHash(tx);
     }
 
     if (isValid) {
-      setUserState(userId, 'waiting_desc', { ...state.data, tx, chain });
-      const explorerUrl = explorerCache.get(chainExplorers[chain]?.tx) ? chainExplorers[chain].tx : fallbackExplorer.tx;
-      const explorerLink = `[View TX](${explorerUrl}${tx})`;
-      responseText = `✅ *TX captured:* ${explorerLink}\n` +
-                     `*Chain:* ${chain}\n\n` +
-                     `📝 *Step 4: Describe the Issue*\n\n` +
-                     `*Please include:*\n` +
-                     `• What went wrong?\n` +
-                     `• Amount involved\n` +
-                     `• Exact error message\n` +
-                     `• For bridges: Destination wallet?\n\n` +
-                     `Reply with description:`;
-      nextState = 'waiting_desc';
+      const nextState = isBridgeCategory(state.data.category) ? 'waiting_dest_tx' : 'waiting_desc';
+      setUserState(userId, nextState, { ...state.data, sourceTx: tx || null });
+      responseText = `✅ *Source TX ${tx ? 'captured' : 'skipped'}:* \`${tx ? tx.slice(0, 10) : 'N/A'}...\`\n\n`;
+      if (nextState === 'waiting_dest_tx') {
+        responseText += `🔗 *Next: Provide Destination TX Hash for ${state.data.destChain} if known*\n\n` +
+                        `Reply with dest TX or type *skip*:`;
+      } else {
+        responseText += `📝 *Next: Describe the Issue*\n\n` +
+                        `*Please include:*\n` +
+                        `• What went wrong? (e.g., "unexpected error")\n` +
+                        `• Amount involved\n` +
+                        `• Exact error message\n` +
+                        `• For bridges: Destination wallet if different\n` +
+                        `• For MoneyX: Trading details\n` +
+                        `• For Casino: USDC chain\n\n` +
+                        `Reply with description:`;
+      }
     } else {
-      responseText = `⚠️ *Invalid TX format.*\n\n` +
+      responseText = `⚠️ *Invalid TX format for ${chain}.* Type *skip* if unknown.\n\n` +
                      `*Examples:*\n` +
                      `• EVM: \`0x1234567890abcdef...\` (exactly 66 chars)\n` +
                      `• Solana: \`5EyP3MgvCY...\`\n\n` +
-                     `Try again:`;
-      nextState = 'waiting_tx';
+                     `Try again or skip:`;
     }
+    await limiter.schedule(() => bot.sendMessage(chatId, responseText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: 'Skip', callback_data: 'skip_tx' }]] } }));
+    return;
+  }
+
+  // Step: waiting_dest_tx
+  if (state.state === 'waiting_dest_tx') {
+    let tx = '';
+    let isValid = false;
+    const chain = state.data.destChain;
+    const isSol = chain === 'SOLANA';
+
+    if (lowerText === 'skip' || data === 'skip_tx') {
+      isValid = true;
+    } else if ((isSol ? solMatch : txMatch)) {
+      tx = isSol ? solMatch[0] : txMatch[0];
+      isValid = isSol ? true : validateEvmTxHash(tx);
+    }
+
+    if (isValid) {
+      setUserState(userId, 'waiting_desc', { ...state.data, destTx: tx || null });
+      responseText = `✅ *Destination TX ${tx ? 'captured' : 'skipped'}.*\n\n` +
+                     `📝 *Next: Describe the Issue*\n\n` +
+                     `*Please include:*\n` +
+                     `• What went wrong? (e.g., "page not found")\n` +
+                     `• Amount involved\n` +
+                     `• Exact error message\n` +
+                     `• Destination wallet if different\n\n` +
+                     `Reply with description:`;
+    } else {
+      responseText = `⚠️ *Invalid TX format for ${chain}.* Type *skip* if unknown.\n\nTry again or skip:`;
+    }
+    await limiter.schedule(() => bot.sendMessage(chatId, responseText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: 'Skip', callback_data: 'skip_tx' }]] } }));
+    return;
   }
 
   // Step: waiting_desc
-  else if (state.state === 'waiting_desc') {
+  if (state.state === 'waiting_desc') {
     const desc = text || '_No description provided_';
+    const solutions = suggestSolutions(desc, state.data.category);
     setUserState(userId, 'waiting_attach', { ...state.data, desc });
     responseText = `📝 *Description noted.*\n\n` +
-                   `📎 *Step 5: Attach Proof (Optional)*\n\n` +
-                   `Send screenshots/videos/documents or type *skip* to submit.\n\n` +
-                   `(You can add more later via "Add More Info" button.)`;
-    nextState = 'waiting_attach';
+                   `*Suggested Solutions:*\n${solutions}\n\n` +
+                   `📎 *Next: Attach Proof (Optional)*\n\n` +
+                   `Send screenshots/videos (e.g., error screens) or type *skip* to submit.\n\n` +
+                   `(Add more later via "Add More Info".)`;
+    await limiter.schedule(() => bot.sendMessage(chatId, responseText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: 'Skip', callback_data: 'skip_attach' }]] } }));
+    return;
   }
 
   // Step: waiting_attach
-  else if (state.state === 'waiting_attach') {
+  if (state.state === 'waiting_attach') {
     const data = { ...state.data };
-    let attachments = [];
+    let attachments = data.attachments || [];
 
     if (msg.photo) {
       attachments.push({ type: 'photo', fileId: msg.photo[msg.photo.length - 1].file_id });
@@ -434,35 +563,29 @@ bot.on('message', async (msg) => {
       attachments.push({ type: 'video', fileId: msg.video.file_id });
     } else if (msg.document) {
       attachments.push({ type: 'document', fileId: msg.document.file_id });
-    } else if (text === 'skip') {
-      // Explicitly proceed to submit on 'skip'
-      await limiter.schedule(() => buildAndSendReport(userId, data, attachments, chatId));
+    } else if (lowerText === 'skip' || data === 'skip_attach') {
+      await buildAndSendReport(userId, data, attachments, chatId);
       resetUserState(userId);
       return;
     } else {
-      // Append to description
       data.desc += `\n\nAdditional: ${text}`;
       setUserState(userId, 'waiting_attach', data);
       responseText = `➕ *Added to description.* Send attachments or type *skip* to submit.`;
-      await limiter.schedule(() => bot.sendMessage(chatId, responseText, { parse_mode: 'Markdown' }));
+      await limiter.schedule(() => bot.sendMessage(chatId, responseText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: 'Skip', callback_data: 'skip_attach' }]] } }));
       return;
     }
 
-    // Submit report with attachments
-    await limiter.schedule(() => buildAndSendReport(userId, data, attachments, chatId));
-    resetUserState(userId);
+    setUserState(userId, 'waiting_attach', { ...data, attachments });
+    responseText = `📎 *Attachment added.* Send more or type *skip* to submit.`;
+    await limiter.schedule(() => bot.sendMessage(chatId, responseText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: 'Skip', callback_data: 'skip_attach' }]] } }));
     return;
   }
 
-  // Fallback: Append to description
-  else {
-    responseText = `ℹ️ *Noted:* ${text}\n(Added to your report. Continue with next step or /cancel.)`;
-    const data = { ...state.data, desc: (state.data.desc || '') + `\n\nFollow-up: ${text}` };
-    setUserState(userId, state.state, data);
-  }
-
+  // Fallback
+  responseText = `ℹ️ *Noted:* ${text}\n(Added to your report if applicable. Continue or /cancel.)`;
+  const updatedData = { ...state.data, desc: (state.data.desc || '') + `\n\nFollow-up: ${text}` };
+  setUserState(userId, state.state, updatedData);
   await limiter.schedule(() => bot.sendMessage(chatId, responseText, { parse_mode: 'Markdown' }));
-  setUserState(userId, nextState, state.data);
 });
 
 // Report building and sending
@@ -473,44 +596,66 @@ async function buildAndSendReport(userId, data, attachments = [], userChatId) {
       swap_issue: '🟣 BESCSWAP',
       bridge_issue: '🟠 BESCbridge',
       wbesc_issue: '🟡 wBESC Bridge',
+      moneyx_issue: '📈 MoneyX (Perps)',
+      casino_issue: '🎰 Casino (USDC)',
       other_issue: '🔧 Other'
     }[data.category] || 'Unknown';
 
-    let finalChain = data.chain || 'BSC';
-    if (data.category === 'swap_issue' && !finalChain.includes('ETH')) {
-      finalChain = 'ETH';
-    }
-
+    const isBridge = isBridgeCategory(data.category);
+    const mainChain = data.chain || (isBridge ? data.sourceChain : 'BSC');
     const descLower = (data.desc || '').toLowerCase();
     let severity = '🟢 Low';
     if (['stuck', 'lost', 'funds', 'hacked', 'urgent', 'exploit', 'drained'].some(kw => descLower.includes(kw))) {
       severity = '🔴 Critical';
-    } else if (['error', 'failed', 'timeout', 'slow'].some(kw => descLower.includes(kw))) {
+    } else if (['error', 'failed', 'timeout', 'slow', 'unexpected', '404', 'not found'].some(kw => descLower.includes(kw))) {
       severity = '🟡 Medium';
     }
 
-    const chain = finalChain;
-    const walletExplorer = explorerCache.get(chainExplorers[chain]?.addr) ? chainExplorers[chain].addr : fallbackExplorer.addr;
-    const txExplorer = explorerCache.get(chainExplorers[chain]?.tx) ? chainExplorers[chain].tx : fallbackExplorer.tx;
-
-    let report = `📌 *[${categoryLabel} ISSUE] – ${chain}* ${severity}\n\n` +
+    let report = `📌 *[${categoryLabel} ISSUE] – ${mainChain}* ${severity}\n\n` +
                  `👤 **Reporter:** ${user.first_name || 'User'} ${user.last_name ? `(${user.last_name})` : ''}\n` +
                  `🔗 **Username:** ${user.username ? `[@${user.username}](tg://user?id=${userId})` : 'N/A'}\n` +
                  `🆔 **Telegram ID:** \`${userId}\`\n`;
+
+    if (isBridge) {
+      report += `🛤️ **Direction:** ${data.sourceChain} → ${data.destChain}\n`;
+    }
+
     if (data.wallet) {
-      report += `💼 **Wallet:** [${data.wallet.slice(0, 8)}...](${walletExplorer}${data.wallet})\n`;
+      await validateExplorerUrl(chainExplorers[mainChain].base);
+      const baseUrl = explorerCache.get(chainExplorers[mainChain].base) ? chainExplorers[mainChain].base : fallbackExplorer.base;
+      const addrPath = chainExplorers[mainChain].addr;
+      const walletUrl = `${baseUrl}${addrPath}${data.wallet}`;
+      report += `💼 **Wallet:** [${data.wallet.slice(0, 8)}...](${walletUrl})\n`;
     }
-    if (data.tx) {
-      report += `🔗 **TX Hash:** [${data.tx.slice(0, 10)}...](${txExplorer}${data.tx})\n`;
+
+    if (data.sourceTx) {
+      const sourceChain = data.sourceChain || mainChain;
+      await validateExplorerUrl(chainExplorers[sourceChain].base);
+      const baseUrl = explorerCache.get(chainExplorers[sourceChain].base) ? chainExplorers[sourceChain].base : fallbackExplorer.base;
+      const txPath = chainExplorers[sourceChain].tx;
+      const sourceTxUrl = `${baseUrl}${txPath}${data.sourceTx}`;
+      report += `🔗 **Source TX (${sourceChain}):** [${data.sourceTx.slice(0, 10)}...](${sourceTxUrl})\n`;
     }
+
+    if (data.destTx) {
+      const destChain = data.destChain;
+      await validateExplorerUrl(chainExplorers[destChain].base);
+      const baseUrl = explorerCache.get(chainExplorers[destChain].base) ? chainExplorers[destChain].base : fallbackExplorer.base;
+      const txPath = chainExplorers[destChain].tx;
+      const destTxUrl = `${baseUrl}${txPath}${data.destTx}`;
+      report += `🔗 **Dest TX (${destChain}):** [${data.destTx.slice(0, 10)}...](${destTxUrl})\n`;
+    }
+
     report += `📝 **Description:**\n\`\`\`${data.desc || '_No description provided_'}\`\`\`\n\n` +
               `📎 **Attachments:** ${attachments.length}\n` +
-              `📅 **Submitted:** ${formatDateUTC()}`;
+              `📅 **Submitted:** ${formatDateUTC()}\n\n` +
+              `*Suggested Solutions:*\n${suggestSolutions(data.desc || '', data.category)}`;
 
     let completeness = '✅ Complete';
     if (!data.wallet) completeness = '⚠️ MISSING WALLET';
-    if (!data.tx) completeness = '⚠️ MISSING TX';
-    if (!data.wallet && !data.tx) completeness = '🚨 INCOMPLETE - NEEDS FOLLOWUP';
+    if (!data.sourceTx) completeness = '⚠️ MISSING SOURCE TX';
+    if (isBridge && !data.destTx) completeness += ' (Dest TX optional)';
+    if (!data.wallet && !data.sourceTx) completeness = '🚨 INCOMPLETE - NEEDS FOLLOWUP';
     report += `\n${completeness}`;
 
     const MAX_MESSAGE_LENGTH = 4096;
@@ -561,7 +706,7 @@ async function buildAndSendReport(userId, data, attachments = [], userChatId) {
         const firstAtt = attachments[0];
         const sendMethod = firstAtt.type === 'photo' ? bot.sendPhoto :
                           firstAtt.type === 'video' ? bot.sendVideo : bot.sendDocument;
-        await limiter.schedule(() => sendMethod(REPORT_CHANNEL_ID, firstAtt.fileId, {
+        const sentMessage = await limiter.schedule(() => sendMethod(REPORT_CHANNEL_ID, firstAtt.fileId, {
           caption: reportMessages[0],
           parse_mode: 'Markdown',
           reply_markup: reportMessages.length === 1 ? getAdminButtons(userId) : {}
@@ -574,9 +719,8 @@ async function buildAndSendReport(userId, data, attachments = [], userChatId) {
         }
         for (let i = 1; i < attachments.length; i++) {
           const att = attachments[i];
-          if (att.type === 'photo') await limiter.schedule(() => bot.sendPhoto(REPORT_CHANNEL_ID, att.fileId));
-          else if (att.type === 'video') await limiter.schedule(() => bot.sendVideo(REPORT_CHANNEL_ID, att.fileId));
-          else await limiter.schedule(() => bot.sendDocument(REPORT_CHANNEL_ID, att.fileId));
+          const sendAttMethod = att.type === 'photo' ? bot.sendPhoto : att.type === 'video' ? bot.sendVideo : bot.sendDocument;
+          await limiter.schedule(() => sendAttMethod(REPORT_CHANNEL_ID, att.fileId));
         }
       }
     } else {
@@ -592,27 +736,39 @@ async function buildAndSendReport(userId, data, attachments = [], userChatId) {
       const alertText = `🔔 New ${severity.includes('Critical') ? '🚨 CRITICAL' : categoryLabel} report from ${user.first_name || userId}`;
       await limiter.schedule(() => bot.sendMessage(ADMIN_CHAT_ID, alertText, {
         reply_markup: {
-          inline_keyboard: [[{ text: 'View Report', url: `https://t.me/c/${REPORT_CHANNEL_ID.slice(4)}` }]]
+          inline_keyboard: [[{ text: 'View Report', url: `https://t.me/c/${REPORT_CHANNEL_ID.slice(4)}/${sentMediaGroupId || ''}` }]]
         }
       }));
     }
 
     const userReview = `✅ *Report Submitted!*\n\n` +
-                       `${categoryLabel} – ${chain} ${severity}\n` +
+                       `${categoryLabel} – ${mainChain} ${severity}\n` +
+                       `${isBridge ? `(${data.sourceChain} → ${data.destChain}) ` : ''}\n` +
                        `${completeness}\n\n` +
                        `Wallet: \`${data.wallet?.slice(0, 10) || 'N/A'}...\`\n` +
-                       `TX: \`${data.tx?.slice(0, 10) || 'N/A'}...\`\n\n` +
-                       `Team will review within 24h. Updates via DM.`;
+                       `Source TX: \`${data.sourceTx?.slice(0, 10) || 'N/A'}...\`\n` +
+                       `Dest TX: \`${data.destTx?.slice(0, 10) || 'N/A'}...\`\n\n` +
+                       `*Suggested Solutions:*\n${suggestSolutions(data.desc || '', data.category)}\n\n` +
+                       `Team will review within 24h. Updates via DM or @BESCLLC.`;
     await limiter.schedule(() => bot.sendMessage(userChatId, userReview, { parse_mode: 'Markdown' }));
 
-    const userButtons = data.tx ? [
-      [{ text: `🔍 View ${chain} TX`, url: `${txExplorer}${data.tx}` }],
+    const userButtons = [];
+    if (data.sourceTx) {
+      const sourceChain = data.sourceChain || mainChain;
+      const baseUrl = explorerCache.get(chainExplorers[sourceChain].base) ? chainExplorers[sourceChain].base : fallbackExplorer.base;
+      const txPath = chainExplorers[sourceChain].tx;
+      userButtons.push([{ text: `🔍 View Source TX (${sourceChain})`, url: `${baseUrl}${txPath}${data.sourceTx}` }]);
+    }
+    if (data.destTx) {
+      const destChain = data.destChain;
+      const baseUrl = explorerCache.get(chainExplorers[destChain].base) ? chainExplorers[destChain].base : fallbackExplorer.base;
+      const txPath = chainExplorers[destChain].tx;
+      userButtons.push([{ text: `🔍 View Dest TX (${destChain})`, url: `${baseUrl}${txPath}${data.destTx}` }]);
+    }
+    userButtons.push(
       [{ text: '📎 Add More Info', callback_data: 'add_more' }],
       [{ text: '❓ Status?', callback_data: 'status' }]
-    ] : [
-      [{ text: '📎 Add More Info', callback_data: 'add_more' }],
-      [{ text: '❓ Status?', callback_data: 'status' }]
-    ];
+    );
     await limiter.schedule(() => bot.sendMessage(userChatId, '💡 *Quick Actions:*', {
       reply_markup: { inline_keyboard: userButtons }
     }));
@@ -620,7 +776,7 @@ async function buildAndSendReport(userId, data, attachments = [], userChatId) {
   } catch (err) {
     logger.error(`Report send failed for user ${userId}: ${err.message}`, { data, attachments });
     await limiter.schedule(() => bot.sendMessage(userChatId,
-      '⚠️ Submission error—please /start again or contact admin directly.',
+      '⚠️ Submission error—please /start again or contact @BESCLLC on X.',
       { parse_mode: 'Markdown' }
     ));
   }
