@@ -140,23 +140,40 @@ function assetRouteText(data) {
 // ---------------------------------------------------------------------------
 // Bridge now fully supports XRP <-> BESC and SOLANA <-> BESC (bi-directional),
 // alongside all EVM routes.
+const ALL_CHAINS = Object.keys(chains);
+
 const supportedChains = {
-  swap_issue: ['BSC', 'ETH', 'BESC'],
-  other_issue: Object.keys(chains),
+  swap_issue: ['BSC', 'ETH', 'BESC'], // BESCswap DEX is deployed per-chain
   bridge_issue: ['XRP', 'SOLANA', 'ETH', 'BSC', 'POLYGON', 'ARBITRUM', 'AVALANCHE', 'OPTIMISM', 'BASE'],
   wbesc_issue: ['XRP', 'SOLANA', 'ETH', 'BSC', 'POLYGON', 'ARBITRUM', 'AVALANCHE', 'OPTIMISM', 'BASE'],
+  cex_issue: ALL_CHAINS,
   moneyx_issue: ['BSC', 'ETH', 'BESC'],
-  casino_issue: ['SOLANA', 'BSC', 'ETH']
+  wallet_issue: ALL_CHAINS,
+  other_issue: ALL_CHAINS
 };
 
 const CATEGORY_LABELS = {
-  swap_issue: '🟣 BESCswap',
+  swap_issue: '🟣 BESCswap (DEX)',
   bridge_issue: '🟠 BESC Bridge',
   wbesc_issue: '🟡 wBESC Bridge',
+  cex_issue: '🏦 BESC CEX',
   moneyx_issue: '📈 MoneyX (Perps)',
-  casino_issue: '🎰 BESC Casino (USDC)',
+  wallet_issue: '📱 BESC Mobile Wallet',
   other_issue: '🔧 Other / General'
 };
+
+// BESCswap runs as a separate DEX on each chain — label the chain buttons
+// so users pick the exact deployment (BESCswap on BSC / ETH / Hyperchain).
+const SWAP_DEX_LABELS = {
+  BSC: '🟣 BESCswap on BSC',
+  ETH: '🟣 BESCswap on Ethereum',
+  BESC: '🟣 BESCswap on Hyperchain'
+};
+
+function chainButtonLabel(category, c) {
+  if (category === 'swap_issue') return SWAP_DEX_LABELS[c] || `🟣 BESCswap on ${chainLabel(c)}`;
+  return chainLabel(c);
+}
 
 // ---------------------------------------------------------------------------
 // Validation patterns + helpers (chain-aware)
@@ -376,11 +393,25 @@ function suggestSolutions(desc, category, data = {}) {
   if (category === 'swap_issue' && (d.includes('slippage') || d.includes('price') || d.includes('revert'))) {
     solutions.push('🔁 Swap reverted: increase slippage tolerance slightly, refresh quotes, and ensure liquidity exists for the pair.');
   }
+  if (category === 'swap_issue') {
+    solutions.push('🟣 BESCswap runs as a separate DEX on each chain — confirm you are on the correct deployment (BSC / Ethereum / Hyperchain) and connected to the matching network.');
+  }
   if (category === 'moneyx_issue' && (d.includes('trade') || d.includes('perp') || d.includes('margin') || d.includes('leverage') || d.includes('liquidat'))) {
     solutions.push('📈 MoneyX (Perps): verify margin balance, leverage, and that you hold sufficient collateral for fees/funding. Note your position size and pair.');
   }
-  if (category === 'casino_issue' && (d.includes('usdc') || d.includes('balance') || d.includes('deposit') || d.includes('withdraw'))) {
-    solutions.push('🎰 Casino (USDC): confirm USDC approval on the correct chain (Solana/BSC/ETH) and that deposit/withdraw used the matching network.');
+  if (category === 'cex_issue') {
+    if (d.includes('login') || d.includes('2fa') || d.includes('password') || d.includes('locked') || d.includes('verify') || d.includes('kyc')) {
+      solutions.push('🏦 BESC CEX access: try a password reset, ensure your 2FA device clock is synced, and complete any pending KYC/verification. Never share OTP codes with anyone.');
+    }
+    if (d.includes('deposit') || d.includes('withdraw') || d.includes('order') || d.includes('balance')) {
+      solutions.push('🏦 BESC CEX funds/orders: confirm the deposit/withdrawal used the correct chain & address, include the on-chain TX hash, and note the asset + amount and order ID if any.');
+    }
+    if (solutions.every(s => !s.startsWith('🏦'))) {
+      solutions.push('🏦 BESC CEX: include your account email/ID (never your password), the affected asset, and exact timestamps so the team can trace it.');
+    }
+  }
+  if (category === 'wallet_issue') {
+    solutions.push('📱 BESC Mobile Wallet: update to the latest app version, then try removing and re-adding the network/token. If a balance is missing, confirm the correct chain and paste the TX hash. ⚠️ The team will NEVER ask for your seed phrase or private keys — never share them with anyone.');
   }
 
   return solutions.length > 0
@@ -433,9 +464,9 @@ function buildStatsText() {
 bot.onText(/^\/help/, async (msg) => {
   const helpText = `📖 *${BOT_NAME} — How to Report*\n\n` +
     `This bot guides you through a precise, step-by-step report so the team can resolve your issue fast.\n\n` +
-    `1️⃣ */start* → choose the affected product (Swap, Bridge, wBESC, MoneyX, Casino, Other)\n` +
+    `1️⃣ */start* → choose the affected product (BESCswap, Bridge, wBESC, CEX, MoneyX, Mobile Wallet, Other)\n` +
     `2️⃣ *Bridges:* pick direction (to/from BESC Hyperchain) and the external chain\n` +
-    `3️⃣ *Others:* pick the chain\n` +
+    `3️⃣ *Others:* pick the chain / DEX deployment\n` +
     `4️⃣ *Wallet:* paste your wallet address\n` +
     `5️⃣ *Source TX:* paste the source transaction hash\n` +
     `6️⃣ *Dest TX:* paste the destination TX (bridges only, optional)\n` +
@@ -450,6 +481,9 @@ bot.onText(/^\/help/, async (msg) => {
     `   • BNB (BSC) ⇄ WBNB on BESC Hyperchain\n` +
     `   • ETH (Ethereum) ⇄ WETH on BESC Hyperchain\n` +
     `   • XRP ⇄ WXRP, SOL ⇄ WSOL, and all other chains\n\n` +
+    `🟣 *BESCswap (DEX)* — a dedicated DEX on each chain: BSC, Ethereum & Hyperchain\n` +
+    `🏦 *BESC CEX* — account, deposits, withdrawals & trading\n` +
+    `📱 *BESC Mobile Wallet* — app, networks, balances & connections\n\n` +
     `🟢 *Pro tips*\n` +
     `   • Include exact errors, amounts, and TX hashes\n` +
     `   • XRP: include the **Destination Tag** if one was used\n` +
@@ -470,17 +504,18 @@ async function sendWelcome(chatId, userId) {
   setUserState(userId, 'waiting_category', {});
   await limiter.schedule(() => bot.sendMessage(chatId,
     `🛰️ *Welcome to the ${BOT_NAME}* 🛰️\n\n` +
-    `The official end-to-end issue desk for the entire BESC ecosystem — Swap, Bridge, wBESC, MoneyX, Casino and more.\n\n` +
+    `The official end-to-end issue desk for the entire BESC ecosystem — BESCswap (DEX), Bridge, wBESC, CEX, MoneyX, Mobile Wallet and more.\n\n` +
     `👇 *Step 1 — Select the affected product:*`,
     {
       parse_mode: 'Markdown',
       reply_markup: {
         inline_keyboard: [
-          [{ text: '🟣 BESCswap', callback_data: 'swap_issue' }],
+          [{ text: '🟣 BESCswap (DEX)', callback_data: 'swap_issue' }],
           [{ text: '🟠 BESC Bridge', callback_data: 'bridge_issue' }],
           [{ text: '🟡 wBESC Bridge', callback_data: 'wbesc_issue' }],
+          [{ text: '🏦 BESC CEX', callback_data: 'cex_issue' }],
           [{ text: '📈 MoneyX (Perps)', callback_data: 'moneyx_issue' }],
-          [{ text: '🎰 BESC Casino (USDC)', callback_data: 'casino_issue' }],
+          [{ text: '📱 BESC Mobile Wallet', callback_data: 'wallet_issue' }],
           [{ text: '🔧 Other / General', callback_data: 'other_issue' }],
           [{ text: '❓ Help', callback_data: 'help' }]
         ]
@@ -531,7 +566,7 @@ bot.on('callback_query', async (cbq) => {
     } else if (data === 'admin_stats') {
       if (!isAdmin(chatId)) { await bot.answerCallbackQuery(cbq.id, { text: '❌ Admin only!' }); return; }
       await limiter.schedule(() => bot.sendMessage(chatId, buildStatsText(), { parse_mode: 'Markdown' }));
-    } else if (['swap_issue', 'bridge_issue', 'wbesc_issue', 'moneyx_issue', 'casino_issue', 'other_issue'].includes(data)) {
+    } else if (['swap_issue', 'bridge_issue', 'wbesc_issue', 'cex_issue', 'moneyx_issue', 'wallet_issue', 'other_issue'].includes(data)) {
       const categoryLabel = CATEGORY_LABELS[data];
       setUserState(userId, isBridgeCategory(data) ? 'waiting_direction' : 'waiting_chain', { category: data });
       if (isBridgeCategory(data)) {
@@ -547,8 +582,11 @@ bot.on('callback_query', async (cbq) => {
           }
         }));
       } else {
-        const keyboard = supportedChains[data].map(c => [{ text: chainLabel(c), callback_data: `chain_${c}` }]);
-        await limiter.schedule(() => bot.editMessageText(`${categoryLabel} *selected.*\n\n👇 *Step 2 — Select chain:*`, {
+        const keyboard = supportedChains[data].map(c => [{ text: chainButtonLabel(data, c), callback_data: `chain_${c}` }]);
+        const stepPrompt = data === 'swap_issue'
+          ? `${categoryLabel} *selected.*\n\n👇 *Step 2 — Which BESCswap deployment?* (each chain runs its own DEX)`
+          : `${categoryLabel} *selected.*\n\n👇 *Step 2 — Select chain:*`;
+        await limiter.schedule(() => bot.editMessageText(stepPrompt, {
           chat_id: chatId,
           message_id: cbq.message.message_id,
           parse_mode: 'Markdown',
@@ -674,8 +712,8 @@ bot.on('message', async (msg) => {
         reply_markup: {
           inline_keyboard: [
             [{ text: '🟣 BESCswap', callback_data: 'swap_issue' }, { text: '🟠 BESC Bridge', callback_data: 'bridge_issue' }],
-            [{ text: '📈 MoneyX', callback_data: 'moneyx_issue' }, { text: '🎰 Casino', callback_data: 'casino_issue' }],
-            [{ text: '🔧 Other', callback_data: 'other_issue' }]
+            [{ text: '🏦 BESC CEX', callback_data: 'cex_issue' }, { text: '📈 MoneyX', callback_data: 'moneyx_issue' }],
+            [{ text: '📱 Mobile Wallet', callback_data: 'wallet_issue' }, { text: '🔧 Other', callback_data: 'other_issue' }]
           ]
         }
       }
