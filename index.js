@@ -103,6 +103,38 @@ const fallbackExplorer = { base: 'https://blockscan.com', tx: '/tx/', addr: '/ad
 const chainLabel = (c) => (chains[c] ? `${c} (${chains[c].label})` : c);
 const chainType = (c) => (chains[c] ? chains[c].type : CHAIN_TYPE.EVM);
 
+// Native gas/asset per chain — used by the wBESC bridge to describe the
+// wrapped-asset mapping (e.g. BNB on BSC -> WBNB on BESC Hyperchain).
+const nativeAsset = {
+  BSC: 'BNB',
+  ETH: 'ETH',
+  POLYGON: 'POL',
+  ARBITRUM: 'ETH',
+  AVALANCHE: 'AVAX',
+  OPTIMISM: 'ETH',
+  BASE: 'ETH',
+  SOLANA: 'SOL',
+  XRP: 'XRP',
+  BESC: 'BESC'
+};
+
+const nativeAssetOf = (c) => nativeAsset[c] || c;
+const wrappedAssetOf = (c) => 'W' + nativeAssetOf(c);
+
+// Human-readable asset flow for the wBESC bridge. Returns null for non-wBESC.
+// to BESC:   <NATIVE> on <ext> -> W<NATIVE> on BESC Hyperchain
+// from BESC: W<NATIVE> on BESC Hyperchain -> <NATIVE> on <ext>
+function assetRouteText(data) {
+  if (data.category !== 'wbesc_issue') return null;
+  const ext = data.direction === 'to BESC' ? data.sourceChain : data.destChain;
+  if (!ext || ext === 'BESC') return null;
+  const nat = nativeAssetOf(ext);
+  const wrap = wrappedAssetOf(ext);
+  return data.direction === 'to BESC'
+    ? `${nat} on ${chainLabel(ext)} → ${wrap} on BESC Hyperchain`
+    : `${wrap} on BESC Hyperchain → ${nat} on ${chainLabel(ext)}`;
+}
+
 // ---------------------------------------------------------------------------
 // Supported chains per category
 // ---------------------------------------------------------------------------
@@ -112,7 +144,7 @@ const supportedChains = {
   swap_issue: ['BSC', 'ETH', 'BESC'],
   other_issue: Object.keys(chains),
   bridge_issue: ['XRP', 'SOLANA', 'ETH', 'BSC', 'POLYGON', 'ARBITRUM', 'AVALANCHE', 'OPTIMISM', 'BASE'],
-  wbesc_issue: ['ETH', 'BSC'],
+  wbesc_issue: ['XRP', 'SOLANA', 'ETH', 'BSC', 'POLYGON', 'ARBITRUM', 'AVALANCHE', 'OPTIMISM', 'BASE'],
   moneyx_issue: ['BSC', 'ETH', 'BESC'],
   casino_issue: ['SOLANA', 'BSC', 'ETH']
 };
@@ -410,10 +442,14 @@ bot.onText(/^\/help/, async (msg) => {
     `7️⃣ *Details:* describe the issue (error text, amount, timestamp)\n` +
     `8️⃣ *Proof:* attach screenshots/videos or type *skip*\n` +
     `9️⃣ *Submit* ✅\n\n` +
-    `🌉 *Bridge routes supported*\n` +
+    `🌉 *BESC Bridge routes*\n` +
     `   • XRP ⇄ BESC Hyperchain\n` +
     `   • Solana ⇄ BESC Hyperchain\n` +
     `   • ETH / BSC / Polygon / Arbitrum / Avalanche / Optimism / Base ⇄ BESC\n\n` +
+    `🟡 *wBESC Bridge (wrapped assets)* — both directions on every chain\n` +
+    `   • BNB (BSC) ⇄ WBNB on BESC Hyperchain\n` +
+    `   • ETH (Ethereum) ⇄ WETH on BESC Hyperchain\n` +
+    `   • XRP ⇄ WXRP, SOL ⇄ WSOL, and all other chains\n\n` +
     `🟢 *Pro tips*\n` +
     `   • Include exact errors, amounts, and TX hashes\n` +
     `   • XRP: include the **Destination Tag** if one was used\n` +
@@ -538,10 +574,13 @@ bot.on('callback_query', async (cbq) => {
       } else {
         sourceChain = 'BESC'; destChain = extChain;
       }
-      setUserState(userId, 'waiting_wallet', { ...state.data, sourceChain, destChain });
+      const newData = { ...state.data, sourceChain, destChain };
+      const assetRoute = assetRouteText(newData);
+      setUserState(userId, 'waiting_wallet', newData);
       await limiter.schedule(() => bot.editMessageText(
-        `Route: *${chainLabel(sourceChain)} → ${chainLabel(destChain)}*\n\n` +
-        `👤 *Step 4 — Your wallet address*\n\n` +
+        `Route: *${chainLabel(sourceChain)} → ${chainLabel(destChain)}*\n` +
+        (assetRoute ? `Asset: *${assetRoute}*\n` : '') +
+        `\n👤 *Step 4 — Your wallet address*\n\n` +
         `Format for ${chainLabel(sourceChain)}: ${walletExample(sourceChain)}\n\nReply with your address:`,
         { chat_id: chatId, message_id: cbq.message.message_id, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [] } }
       ));
@@ -798,6 +837,8 @@ async function buildAndSendReport(userId, data, attachments = [], userChatId) {
 
     if (isBridge) {
       report += `🛤️ *Route:* ${chainLabel(data.sourceChain)} → ${chainLabel(data.destChain)}\n`;
+      const assetRoute = assetRouteText(data);
+      if (assetRoute) report += `🪙 *Asset:* ${assetRoute}\n`;
     }
 
     if (data.wallet) {
@@ -916,6 +957,7 @@ async function buildAndSendReport(userId, data, attachments = [], userChatId) {
       `🧾 *ID:* \`${reportId}\`\n` +
       `${categoryLabel} — ${chainLabel(mainChain)} ${severity}\n` +
       `${isBridge ? `Route: ${chainLabel(data.sourceChain)} → ${chainLabel(data.destChain)}\n` : ''}` +
+      `${assetRouteText(data) ? `Asset: ${assetRouteText(data)}\n` : ''}` +
       `${completeness}\n\n` +
       `💼 Wallet: \`${data.wallet ? data.wallet.slice(0, 10) + '...' : 'N/A'}\`\n` +
       `🔗 Source TX: \`${data.sourceTx ? data.sourceTx.slice(0, 12) + '...' : 'N/A'}\`\n` +
