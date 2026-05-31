@@ -1,7 +1,7 @@
 {
-  "name": "besc-report-bot",
-  "version": "1.0.1",
-  "description": "Telegram bot for reporting BESCswap & BESCbridge issues",
+  "name": "besc-ecosystem-report-bot",
+  "version": "2.0.0",
+  "description": "BESC ECOSYSTEM REPORT BOT — tier-1 Telegram issue desk for BESCswap, BESC Bridge (incl. XRP & Solana ⇄ BESC Hyperchain), wBESC, MoneyX & Casino",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -25,7 +25,13 @@
     "bot",
     "besc",
     "blockchain",
-    "report"
+    "report",
+    "bridge",
+    "xrp",
+    "solana",
+    "besc-hyperchain",
+    "moneyx",
+    "casino"
   ],
   "repository": {
     "type": "git",
