@@ -265,8 +265,10 @@ function resetUserState(userId) {
   cooldowns.delete(userId);
 }
 
-function isAdmin(chatId) {
-  return ADMIN_CHAT_ID && chatId.toString() === ADMIN_CHAT_ID;
+// Always compare against the user's personal Telegram ID (from.id / userId),
+// NOT the group/channel chatId — they are different values in group contexts.
+function isAdmin(userId) {
+  return ADMIN_CHAT_ID && userId.toString() === ADMIN_CHAT_ID;
 }
 
 function getAdminButtons(userId) {
@@ -423,7 +425,7 @@ function suggestSolutions(desc, category, data = {}) {
 // Commands
 // ---------------------------------------------------------------------------
 bot.onText(/^\/stats/, async (msg) => {
-  if (!isAdmin(msg.chat.id)) {
+  if (!isAdmin(msg.from.id)) {
     return limiter.schedule(() => bot.sendMessage(msg.chat.id, '❌ Admin-only command.', { parse_mode: 'Markdown' }));
   }
   await limiter.schedule(() => bot.sendMessage(msg.chat.id, buildStatsText(), { parse_mode: 'Markdown' }));
@@ -540,7 +542,7 @@ bot.on('callback_query', async (cbq) => {
     if (data === 'help') {
       await limiter.schedule(() => bot.sendMessage(chatId, 'ℹ️ Use /help for the full reporting guide.', { parse_mode: 'Markdown' }));
     } else if (/^resolve_/.test(data)) {
-      if (!isAdmin(chatId)) { await bot.answerCallbackQuery(cbq.id, { text: '❌ Admin only!' }); return; }
+      if (!isAdmin(userId)) { await bot.answerCallbackQuery(cbq.id, { text: '❌ Admin only!' }); return; }
       const resolveUserId = data.split('_')[1];
       metrics.reportsResolved += 1;
       await limiter.schedule(() => bot.editMessageReplyMarkup({ inline_keyboard: [] }, {
@@ -556,7 +558,7 @@ bot.on('callback_query', async (cbq) => {
         logger.error(`Failed to notify user ${resolveUserId}: ${e.message}`);
       }
     } else if (/^reopen_/.test(data)) {
-      if (!isAdmin(chatId)) { await bot.answerCallbackQuery(cbq.id, { text: '❌ Admin only!' }); return; }
+      if (!isAdmin(userId)) { await bot.answerCallbackQuery(cbq.id, { text: '❌ Admin only!' }); return; }
       const reopenUserId = data.split('_')[1];
       metrics.reportsReopened += 1;
       await limiter.schedule(() => bot.editMessageReplyMarkup(getAdminButtons(reopenUserId), {
@@ -564,7 +566,7 @@ bot.on('callback_query', async (cbq) => {
       }));
       await limiter.schedule(() => bot.sendMessage(chatId, `🔄 *Report REOPENED* for user \`${reopenUserId}\`.`, { parse_mode: 'Markdown' }));
     } else if (data === 'admin_stats') {
-      if (!isAdmin(chatId)) { await bot.answerCallbackQuery(cbq.id, { text: '❌ Admin only!' }); return; }
+      if (!isAdmin(userId)) { await bot.answerCallbackQuery(cbq.id, { text: '❌ Admin only!' }); return; }
       await limiter.schedule(() => bot.sendMessage(chatId, buildStatsText(), { parse_mode: 'Markdown' }));
     } else if (['swap_issue', 'bridge_issue', 'wbesc_issue', 'cex_issue', 'moneyx_issue', 'wallet_issue', 'other_issue'].includes(data)) {
       const categoryLabel = CATEGORY_LABELS[data];
